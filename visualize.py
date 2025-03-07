@@ -58,7 +58,6 @@ def plot_spectrum_with_annotation(spec, predicted_seq):
     plt.show()
 
 if __name__ == "__main__":
-    # Example: visualize a sample spectrum.
     sample_spec = {
         "title": "Spec_0",
         "mz": np.array([100.0, 150.0, 200.0, 250.0, 300.0]),

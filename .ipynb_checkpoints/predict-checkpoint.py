@@ -4,7 +4,7 @@ import numpy as np
 import argparse
 from model import CasanovoPTM, MGF_Dataset, AA_VOCAB_SIZE, NUM_OFFSET_BINS
 
-# Mapping: PAD=0, SOS=1, EOS=2, then A=3, C=4, ...
+# Mapping: PAD=0, SOS=1, EOS=2, then A=3, C=4, etc.
 idx_to_aa = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>"}
 aa_list = list("ACDEFGHIKLMNPQRSTVWY")
 for i, aa in enumerate(aa_list, start=3):
@@ -27,7 +27,7 @@ def predict_sequence(model, peak_seq, peak_mask, max_len=36, device=torch.device
     generated = [sos_token]
     with torch.no_grad():
         for _ in range(max_len - 1):
-            tgt = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)  # [batch, tgt_len]
+            tgt = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
             tgt_mask = model.generate_square_subsequent_mask(tgt.size(1)).to(device)
             aa_logits, mod_logits = model(peak_seq, peak_mask, tgt, tgt_mask)
             next_token = int(torch.argmax(aa_logits[:, -1, :]).item())

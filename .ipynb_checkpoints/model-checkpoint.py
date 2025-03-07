@@ -5,6 +5,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from rich.progress import track
+import time
 
 # Global token definitions
 PAD_TOKEN_ID = 0    # Padding token ID
@@ -107,7 +109,7 @@ def msp_to_mgf(msp_filename, mgf_filename):
 # Casanovo Transformer Model for PTM Prediction (batch_first=True)
 # -------------------------------------------------------------------
 class CasanovoPTM(nn.Module):
-    def __init__(self, aa_vocab_size, num_offset_bins, d_model=512, nhead=8, num_layers=6):
+    def __init__(self, aa_vocab_size, num_offset_bins, d_model=256, nhead=2, num_layers=2):
         super(CasanovoPTM, self).__init__()
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -143,13 +145,16 @@ class CasanovoPTM(nn.Module):
         return mask
 
 # -------------------------------------------------------------------
-# PyTorch Dataset for Annotated MGF Files
+# PyTorch Dataset for Annotated MGF Files (only PTM peptides)
 # -------------------------------------------------------------------
 from torch.utils.data import Dataset, DataLoader
 
 class MGF_Dataset(Dataset):
     def __init__(self, mgf_filename, src_len=100, tgt_len=36):
         self.spectra = self.load_mgf(mgf_filename)
+        # Filter spectra to include only peptides with PTMs
+        self.spectra = [spec for spec in self.spectra if spec.get("Mods", "0") != "0"]
+        print(f"Filtered dataset size (with PTMs): {len(self.spectra)}")
         self.src_len = src_len
         self.tgt_len = tgt_len
     
@@ -172,6 +177,8 @@ class MGF_Dataset(Dataset):
                     current_spec["charge"] = int(ch)
                 elif line.startswith("SEQ="):
                     current_spec["sequence"] = line.split("=", 1)[1]
+                elif line.startswith("Mods="):
+                    current_spec["Mods"] = line.split("=", 1)[1]
                 elif line == "END IONS":
                     current_spec["mz"] = []
                     current_spec["intensity"] = []
@@ -203,14 +210,14 @@ class MGF_Dataset(Dataset):
         else:
             peak_tensor = peak_tensor[:self.src_len]
             peak_mask = torch.zeros(self.src_len, dtype=torch.bool)
-        # Normalize the target sequence: uppercase and strip spaces.
+        # Normalize target sequence: uppercase and strip spaces.
         seq = spec["sequence"].strip().upper()
         # Allowed vocabulary: <PAD>, <SOS>, <EOS>, then 20 standard amino acids.
         vocab = ["<PAD>", "<SOS>", "<EOS>"] + list("ACDEFGHIKLMNPQRSTVWY")
         aa_to_idx = {token: idx for idx, token in enumerate(vocab)}
         tgt_tokens = [aa_to_idx["<SOS>"]]
         for ch in seq:
-            tgt_tokens.append(aa_to_idx.get(ch, aa_to_idx["A"]))  # default to "A"
+            tgt_tokens.append(aa_to_idx.get(ch, aa_to_idx["A"]))
         tgt_tokens.append(aa_to_idx["<EOS>"])
         if len(tgt_tokens) < self.tgt_len:
             tgt_tokens = tgt_tokens + [PAD_TOKEN_ID]*(self.tgt_len - len(tgt_tokens))
@@ -220,7 +227,7 @@ class MGF_Dataset(Dataset):
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.tgt_len)
         return peak_tensor, peak_mask, tgt_tensor, tgt_mask
 
-def get_dataloaders(mgf_filename, batch_size=16, split_ratio=0.8):
+def get_dataloaders(mgf_filename, batch_size=4, split_ratio=0.8):
     dataset = MGF_Dataset(mgf_filename)
     total = len(dataset)
     train_size = int(split_ratio * total)
@@ -231,26 +238,28 @@ def get_dataloaders(mgf_filename, batch_size=16, split_ratio=0.8):
     return train_loader, val_loader
 
 # -------------------------------------------------------------------
-# Training Loop with Mixed Precision (AMP)
+# Training Loop with Mixed Precision (AMP) and Rich Progress
 # -------------------------------------------------------------------
 def train_model(model, train_loader, val_loader, num_epochs=10, device=torch.device("cuda")):
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device_type="cuda")
     for epoch in range(num_epochs):
         total_loss = 0.0
-        for peak_seq, peak_mask, tgt_seq, tgt_mask in train_loader:
+        # Use rich's progress track to monitor batches.
+        for i, (peak_seq, peak_mask, tgt_seq, tgt_mask) in enumerate(track(train_loader, description=f"Epoch {epoch+1}/{num_epochs}")):
             peak_seq = peak_seq.to(device)
             peak_mask = peak_mask.to(device)
             tgt_seq = tgt_seq.to(device)
             tgt_mask = tgt_mask.to(device)
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                # Unbatch the target mask:
+            with torch.amp.autocast(device_type="cuda"):
+                # Unbatch target mask: all examples use the same mask.
                 mask = tgt_mask[0, :-1, :-1]
                 aa_logits, mod_logits = model(peak_seq, peak_mask, tgt_seq[:, :-1], mask)
                 aa_target = tgt_seq[:, 1:]
-                mod_target = tgt_seq[:, 1:]
+                # For unmodified peptides, set mod target to index corresponding to 0 offset.
+                mod_target = torch.full_like(tgt_seq[:, 1:], 10)
                 loss_aa = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)(aa_logits.reshape(-1, AA_VOCAB_SIZE), aa_target.reshape(-1))
                 loss_mod = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)(mod_logits.reshape(-1, NUM_OFFSET_BINS), mod_target.reshape(-1))
                 loss = loss_aa + loss_mod
@@ -264,15 +273,23 @@ def train_model(model, train_loader, val_loader, num_epochs=10, device=torch.dev
     print("Training complete. Model saved as 'casanovo_ptm_finetuned.pt'.")
 
 if __name__ == "__main__":
+    print("Checking device")
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
+    
+    print("Loading the data...")
     msp_file = "./datasets/human_hcd_tryp_best.msp"
     mgf_file = "./datasets/human_hcd_tryp_best.mgf"
     if not os.path.exists(mgf_file):
-        msp_to_mgf(msp_file, mgf_file) 
+        msp_to_mgf(msp_file, mgf_file)
+    print("Data loaded.")
     
-    train_loader, val_loader = get_dataloaders(mgf_file, batch_size=16)
+    print("Initializing the dataloaders..")
+    train_loader, val_loader = get_dataloaders(mgf_file, batch_size=4)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CasanovoPTM(AA_VOCAB_SIZE, NUM_OFFSET_BINS, d_model=512, nhead=8, num_layers=6).to(device)
+    model = CasanovoPTM(AA_VOCAB_SIZE, NUM_OFFSET_BINS, d_model=256, nhead=2, num_layers=2).to(device)
     
+    print("Load Model")
     checkpoint_path = "models/casanovo_v4_2_0.ckpt"
     if os.path.exists(checkpoint_path):
         import numpy as np
@@ -284,4 +301,5 @@ if __name__ == "__main__":
         print("Pretrained checkpoint not found. Exiting.")
         exit(1)
     
-    train_model(model, train_loader, val_loader, num_epochs=10, device=device)
+    print("Training Started...")
+    train_model(model, train_loader, val_loader, num_epochs=1, device=device)
