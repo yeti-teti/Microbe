@@ -137,58 +137,57 @@ class SequenceGenerator(nn.Module):
         return F.log_softmax(logits / temperature, dim=-1)
 
 class PTMLocalPredictor(nn.Module):
-    """Predicts local PTM presence and mass offset"""
+    """Predicts local PTM presence (logits) and mass offset"""
     def __init__(self, d_model):
         super(PTMLocalPredictor, self).__init__()
+        # Remove Sigmoid here — we output raw logits for presence
         self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
+            nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model//2, 1),
-            nn.Sigmoid()
+            nn.Linear(d_model // 2, 1)
         )
         
         self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
+            nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model//2, 1)
+            nn.Linear(d_model // 2, 1)
         )
     
     def forward(self, x):
         """
         Args:
             x: Transformer decoder output [batch, seq_len, d_model]
-        
+
         Returns:
-            ptm_presence: Probability of PTM at each position [batch, seq_len]
+            ptm_presence: Logits for PTM presence [batch, seq_len]
             ptm_offset: Predicted mass shift at each position [batch, seq_len]
         """
-        ptm_presence = self.ptm_presence(x).squeeze(-1)
-        ptm_offset = self.ptm_offset(x).squeeze(-1)
+        ptm_presence = self.ptm_presence(x).squeeze(-1)  # shape: [batch, seq_len]
+        ptm_offset = self.ptm_offset(x).squeeze(-1)      # shape: [batch, seq_len]
         
         return ptm_presence, ptm_offset
 
+
 class PTMGlobalPredictor(nn.Module):
-    """Predicts global PTM presence and total mass offset"""
+    """Predicts global PTM presence (logits) and total mass offset"""
     def __init__(self, d_model):
         super(PTMGlobalPredictor, self).__init__()
-        # Attention pooling
+        # Attention pooling for the sequence
         self.attention = nn.Sequential(
             nn.Linear(d_model, 1),
             nn.Softmax(dim=1)
         )
         
-        # Global prediction heads
         self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
+            nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model//2, 1),
-            nn.Sigmoid()
+            nn.Linear(d_model // 2, 1)
         )
         
         self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
+            nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model//2, 1)
+            nn.Linear(d_model // 2, 1)
         )
     
     def forward(self, x, mask=None):
@@ -198,7 +197,7 @@ class PTMGlobalPredictor(nn.Module):
             mask: Sequence mask [batch, seq_len]
             
         Returns:
-            ptm_presence: Global PTM presence [batch]
+            ptm_presence: Logits for global PTM presence [batch]
             ptm_offset: Global PTM offset [batch]
         """
         # Compute attention weights
@@ -210,14 +209,15 @@ class PTMGlobalPredictor(nn.Module):
             attn_weights = attn_weights * mask
             attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-9)
         
-        # Weighted pooling 
+        # Weighted pooling to get a single vector
         global_repr = (x * attn_weights).sum(dim=1)  # [batch, d_model]
         
-        # Predict global PTM presence and offset
-        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)
-        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)
+        # Predict global PTM presence (logits) and offset
+        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)  # shape: [batch]
+        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)      # shape: [batch]
         
         return ptm_presence, ptm_offset
+
 
 class Spec2PepWithPTM(nn.Module):
     """
