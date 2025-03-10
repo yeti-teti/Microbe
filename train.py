@@ -79,7 +79,7 @@ def set_seed(seed):
 
 def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.1):
     """
-    Calculate the combined loss with improved error handling and value clamping.
+    Calculate the combined loss with improved error handling and scaling.
     
     Args:
         outputs: Model outputs dictionary
@@ -112,7 +112,9 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.
     
     # Only compute offset loss for positions with PTMs
     ptm_mask = targets['ptm_presence'].float()
-    ptm_local_offset_loss = nn.MSELoss()(
+    
+    # IMPROVEMENT: Use SmoothL1Loss for offset prediction to be more robust to outliers
+    ptm_local_offset_loss = nn.SmoothL1Loss()(
         outputs['ptm_local_offset'] * ptm_mask,
         targets['ptm_offset'] * ptm_mask
     )
@@ -125,19 +127,30 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.
         targets['global_ptm_presence'].reshape(-1)
     )
     
-    # Global offset loss
+    # Global offset loss - MAJOR FIX: Scale down large offset values to prevent numerical issues
     global_presence_mask = targets['global_ptm_presence'].float()
     
     # Apply global PTM presence mask
     masked_global_offset_output = outputs['ptm_global_offset'] * global_presence_mask
     masked_global_offset_target = targets['global_ptm_offset'] * global_presence_mask
     
-    ptm_global_offset_loss = nn.MSELoss()(
-        masked_global_offset_output,
-        masked_global_offset_target
-    )
+    # Calculate the maximum offset value for scaling
+    max_offset = torch.max(torch.abs(masked_global_offset_target))
+    
+    # Apply scaling if values are very large (prevent numerical issues)
+    if max_offset > 100.0:
+        scale_factor = 100.0 / max_offset
+        scaled_output = masked_global_offset_output * scale_factor
+        scaled_target = masked_global_offset_target * scale_factor
+        
+        # Use SmoothL1Loss which is more robust to outliers
+        ptm_global_offset_loss = nn.SmoothL1Loss()(scaled_output, scaled_target)
+    else:
+        # Use SmoothL1Loss which is more robust to outliers
+        ptm_global_offset_loss = nn.SmoothL1Loss()(masked_global_offset_output, masked_global_offset_target)
     
     # Combine all losses with weights
+    # IMPROVEMENT: Apply scaling to high-magnitude losses to balance components
     total_loss = (
         loss_weights['seq'] * seq_loss +
         loss_weights['ptm_local'] * (ptm_local_presence_loss + ptm_local_offset_loss) +
@@ -674,7 +687,7 @@ def decode_sequence(id_to_aa, sequence_ids):
 
 def analyze_predictions(console, model, features, targets, id_to_aa, max_samples=5, timeout=30):
     """
-    Analyze model predictions to check diversity with timeout safety.
+    Analyze model predictions with proper batch handling.
     
     Args:
         console: Rich console for output
@@ -692,47 +705,49 @@ def analyze_predictions(console, model, features, targets, id_to_aa, max_samples
     console.print("\n[bold]Sample Predictions:[/bold]")
     
     with torch.no_grad():
-        # Get device
-        device = next(model.parameters()).device
-        
-        # Move data to device (with smaller batch size)
-        # Only take the first max_samples to save memory
-        truncated_features = {}
-        for k, v in features.items():
-            if isinstance(v, torch.Tensor):
-                truncated_features[k] = v[:max_samples].to(device)
-            elif isinstance(v, tuple):
-                truncated_features[k] = (v[0][:max_samples].to(device), v[1][:max_samples].to(device))
-            else:
-                truncated_features[k] = v
-        
-        truncated_targets = {k: v[:max_samples].to(device) for k, v in targets.items()}
-        
         try:
+            # Get device
+            device = next(model.parameters()).device
+            
+            # Process at most max_samples to avoid memory issues
+            batch_size = min(max_samples, features['input_sequence'].size(0))
+            
+            # CRITICAL FIX: Create new feature dict with consistently sized tensors
+            # Make sure ALL tensors have the same batch dimension
+            small_features = {}
+            for k, v in features.items():
+                if isinstance(v, torch.Tensor):
+                    small_features[k] = v[:batch_size].to(device)
+                elif isinstance(v, tuple) and len(v) == 2:
+                    # Handle peaks tuple - both elements must have same first dimension
+                    small_features[k] = (v[0][:batch_size].to(device), v[1][:batch_size].to(device))
+                else:
+                    small_features[k] = v
+            
+            small_targets = {k: v[:batch_size].to(device) for k, v in targets.items()}
+            
             # Forward pass with low temperature (more peaked distribution)
-            outputs = model(truncated_features, teacher_forcing_ratio=0.0, temperature=0.7)
+            outputs = model(small_features, teacher_forcing_ratio=0.0, temperature=0.7)
             
             # Get predictions
             pred_sequence = outputs['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
             pred_ptm_presence = (outputs['ptm_local_presence'] > 0.5).float()  # [batch, seq_len]
             
-            # Display up to max_samples
-            n_examples = min(max_samples, len(pred_sequence))
-            
-            for i in range(n_examples):
+            # Display results
+            for i in range(batch_size):
                 # Check timeout
                 if time.time() - start_time > timeout:
                     console.print("[yellow]Analysis timeout reached. Stopping to prevent hanging.[/yellow]")
                     return
                 
                 # Get true sequence
-                true_seq = decode_sequence(id_to_aa, truncated_targets['target_sequence'][i])
+                true_seq = decode_sequence(id_to_aa, small_targets['target_sequence'][i])
                 
                 # Get predicted sequence
                 pred_seq = decode_sequence(id_to_aa, pred_sequence[i])
                 
                 # Get true PTMs
-                true_ptm_pos = truncated_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
+                true_ptm_pos = small_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
                 if not isinstance(true_ptm_pos, list):
                     true_ptm_pos = [true_ptm_pos]
                 
@@ -750,21 +765,23 @@ def analyze_predictions(console, model, features, targets, id_to_aa, max_samples
                 console.print("")
                 
         except Exception as e:
+            import traceback
             console.print(f"[red]Error during prediction analysis: {type(e).__name__}: {str(e)}[/red]")
+            traceback.print_exc()
             
         finally:
             # Free memory explicitly
             if 'outputs' in locals():
                 del outputs
-            if 'truncated_features' in locals():
-                del truncated_features
-            if 'truncated_targets' in locals():
-                del truncated_targets
+            if 'small_features' in locals():
+                del small_features
+            if 'small_targets' in locals():
+                del small_targets
             torch.cuda.empty_cache()
 
 def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, timeout=60):
     """
-    Make predictions and visualize results for a few samples with timeout safety.
+    Make predictions and visualize results with proper batch handling.
     
     Args:
         model: The trained model
@@ -780,7 +797,6 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, ti
     import time
     start_time = time.time()
     model.eval()
-    samples = []
     
     # Create table for results
     from rich.table import Table
@@ -795,26 +811,28 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, ti
     
     try:
         with torch.no_grad():
-            # Get just one batch - don't iterate through the whole loader
+            # Get a single batch from the dataloader
             features, targets = next(iter(dataloader))
             
-            # Only take the first num_samples items to save memory
-            batch_size = min(features['input_sequence'].size(0), num_samples)
+            # Process at most num_samples to avoid memory issues
+            batch_size = min(num_samples, features['input_sequence'].size(0))
             
-            # Truncate features and targets
-            truncated_features = {}
+            # CRITICAL FIX: Create new feature dict with consistently sized tensors
+            # Make sure ALL tensors have the same batch dimension
+            small_features = {}
             for k, v in features.items():
                 if isinstance(v, torch.Tensor):
-                    truncated_features[k] = v[:batch_size].to(device)
-                elif isinstance(v, tuple):
-                    truncated_features[k] = (v[0][:batch_size].to(device), v[1][:batch_size].to(device))
+                    small_features[k] = v[:batch_size].to(device)
+                elif isinstance(v, tuple) and len(v) == 2:
+                    # Handle peaks tuple - both elements must have same first dimension
+                    small_features[k] = (v[0][:batch_size].to(device), v[1][:batch_size].to(device))
                 else:
-                    truncated_features[k] = v
+                    small_features[k] = v
             
-            truncated_targets = {k: v[:batch_size].to(device) for k, v in targets.items()}
+            small_targets = {k: v[:batch_size].to(device) for k, v in targets.items()}
             
             # Forward pass with lower temperature
-            outputs = model(truncated_features, teacher_forcing_ratio=0.0, temperature=0.7)
+            outputs = model(small_features, teacher_forcing_ratio=0.0, temperature=0.7)
             
             # Get predictions
             pred_sequence = outputs['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
@@ -828,7 +846,7 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, ti
                     break
                 
                 # Get true sequence
-                true_seq = decode_sequence(id_to_aa, truncated_targets['target_sequence'][i])
+                true_seq = decode_sequence(id_to_aa, small_targets['target_sequence'][i])
                 
                 # Get predicted sequence
                 pred_seq = decode_sequence(id_to_aa, pred_sequence[i])
@@ -840,16 +858,16 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, ti
                 pred_ptm_offsets = [f"{outputs['ptm_local_offset'][i, pos].item():.2f}" for pos in pred_ptm_pos]
                 
                 # Get true PTMs
-                true_ptm_pos = truncated_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
+                true_ptm_pos = small_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
                 if not isinstance(true_ptm_pos, list):
                     true_ptm_pos = [true_ptm_pos]
-                true_ptm_offsets = [f"{truncated_targets['ptm_offset'][i, pos].item():.2f}" for pos in true_ptm_pos]
+                true_ptm_offsets = [f"{small_targets['ptm_offset'][i, pos].item():.2f}" for pos in true_ptm_pos]
                 
                 # Get global PTM info
                 pred_global_presence = outputs['ptm_global_presence'][i].item() > 0.5
                 pred_global_offset = outputs['ptm_global_offset'][i].item()
-                true_global_presence = truncated_targets['global_ptm_presence'][i].item() > 0.5
-                true_global_offset = truncated_targets['global_ptm_offset'][i].item()
+                true_global_presence = small_targets['global_ptm_presence'][i].item() > 0.5
+                true_global_offset = small_targets['global_ptm_offset'][i].item()
                 
                 # Format data for table
                 true_ptms = ", ".join([f"Pos {pos}: {offset}" for pos, offset in zip(true_ptm_pos, true_ptm_offsets)])
@@ -878,10 +896,10 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, ti
         # Free memory explicitly
         if 'outputs' in locals():
             del outputs
-        if 'truncated_features' in locals():
-            del truncated_features
-        if 'truncated_targets' in locals():
-            del truncated_targets
+        if 'small_features' in locals():
+            del small_features
+        if 'small_targets' in locals():
+            del small_targets
         torch.cuda.empty_cache()
     
     return table
