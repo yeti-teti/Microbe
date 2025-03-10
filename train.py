@@ -247,6 +247,14 @@ def train_one_epoch(
         train_task = progress.add_task("Training", total=len(dataloader))
         
         for batch_idx, (features, targets) in enumerate(dataloader):
+            # Move features to device
+            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
+                      (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
+                      for k, v in features.items()}
+            
+            # Move targets to device
+            targets = {k: v.to(device) for k, v in targets.items()}
+            
             # Forward pass
             outputs = model(
                 features, 
@@ -294,6 +302,7 @@ def train_one_epoch(
     
     return avg_loss_info['total'], avg_loss_info
 
+
 def evaluate(
     model, 
     dataloader, 
@@ -332,6 +341,14 @@ def evaluate(
     
     with torch.no_grad():
         for features, targets in dataloader:
+            # Move features to device
+            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
+                      (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
+                      for k, v in features.items()}
+            
+            # Move targets to device
+            targets = {k: v.to(device) for k, v in targets.items()}
+            
             # Forward pass
             outputs = model(features, teacher_forcing_ratio=1.0, temperature=temperature)
             
