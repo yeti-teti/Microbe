@@ -137,84 +137,87 @@ class SequenceGenerator(nn.Module):
         return F.log_softmax(logits / temperature, dim=-1)
 
 class PTMLocalPredictor(nn.Module):
-    """Predicts local PTM presence (logits) and mass offset."""
+    """Predicts local PTM presence and mass offset"""
     def __init__(self, d_model):
         super(PTMLocalPredictor, self).__init__()
-        # We output raw logits for presence, so no Sigmoid here:
         self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model//2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)  # raw logits
+            nn.Linear(d_model//2, 1),
+            nn.Sigmoid()
         )
         
         self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model//2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)
+            nn.Linear(d_model//2, 1)
         )
     
     def forward(self, x):
         """
-        x: [batch, seq_len, d_model]
+        Args:
+            x: Transformer decoder output [batch, seq_len, d_model]
+        
         Returns:
-            ptm_presence: shape [batch, seq_len] (logits)
-            ptm_offset:   shape [batch, seq_len]
+            ptm_presence: Probability of PTM at each position [batch, seq_len]
+            ptm_offset: Predicted mass shift at each position [batch, seq_len]
         """
-        ptm_presence = self.ptm_presence(x).squeeze(-1)  # [batch, seq_len]
-        ptm_offset = self.ptm_offset(x).squeeze(-1)      # [batch, seq_len]
+        ptm_presence = self.ptm_presence(x).squeeze(-1)
+        ptm_offset = self.ptm_offset(x).squeeze(-1)
+        
         return ptm_presence, ptm_offset
 
-
 class PTMGlobalPredictor(nn.Module):
-    """Predicts global PTM presence (logits) and total mass offset."""
+    """Predicts global PTM presence and total mass offset"""
     def __init__(self, d_model):
         super(PTMGlobalPredictor, self).__init__()
-        # Weighted attention pooling across sequence:
+        # Attention pooling
         self.attention = nn.Sequential(
             nn.Linear(d_model, 1),
             nn.Softmax(dim=1)
         )
         
-        # Output raw logits for presence:
+        # Global prediction heads
         self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model//2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)  # raw logits
+            nn.Linear(d_model//2, 1),
+            nn.Sigmoid()
         )
         
         self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model//2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)
+            nn.Linear(d_model//2, 1)
         )
     
     def forward(self, x, mask=None):
         """
-        x: [batch, seq_len, d_model]
-        mask: [batch, seq_len], 1/True=keep, 0/False=ignore
+        Args:
+            x: Decoder output [batch, seq_len, d_model]
+            mask: Sequence mask [batch, seq_len]
+            
         Returns:
-            ptm_presence: shape [batch] (logits)
-            ptm_offset:   shape [batch]
+            ptm_presence: Global PTM presence [batch]
+            ptm_offset: Global PTM offset [batch]
         """
-        # Compute attention weights over seq_len
+        # Compute attention weights
         attn_weights = self.attention(x)  # [batch, seq_len, 1]
         
         if mask is not None:
-            # Apply mask to zero out weights
-            mask = mask.float().unsqueeze(-1)  # [batch, seq_len, 1]
+            # Apply mask to attention weights
+            mask = mask.float().unsqueeze(-1)
             attn_weights = attn_weights * mask
-            # Renormalize so they sum to 1
             attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-9)
         
-        # Weighted average across seq_len
+        # Weighted pooling 
         global_repr = (x * attn_weights).sum(dim=1)  # [batch, d_model]
         
-        # Predict presence (logits) + offset
-        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)  # [batch]
-        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)      # [batch]
+        # Predict global PTM presence and offset
+        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)
+        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)
         
         return ptm_presence, ptm_offset
-    
 
 class Spec2PepWithPTM(nn.Module):
     """
@@ -282,7 +285,7 @@ class Spec2PepWithPTM(nn.Module):
     
     def forward(self, features, teacher_forcing_ratio=1.0, temperature=1.0):
         """
-        Forward pass through the model with optional teacher forcing and temperature scaling.
+        Forward pass through the model with improved error handling.
         
         Args:
             features: Dictionary containing:
@@ -294,7 +297,7 @@ class Spec2PepWithPTM(nn.Module):
             temperature: Temperature parameter for softmax (lower = more peaked distribution)
         
         Returns:
-            Dictionary of model outputs
+            Dictionary of model outputs with properly formatted tensors
         """
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -427,6 +430,33 @@ class Spec2PepWithPTM(nn.Module):
             decoder_output, 
             mask=attention_mask
         )
+        
+        # Ensure proper tensor dimensions and value ranges
+        # Sigmoid is already applied in PTMLocalPredictor, but double-check the range
+        ptm_local_presence = torch.clamp(ptm_local_presence, 0.0, 1.0)
+        
+        # Ensure global PTM presence is properly shaped (batch_size,) or (batch_size, 1)
+        if ptm_global_presence.dim() > 2:
+            ptm_global_presence = ptm_global_presence.squeeze()
+        if ptm_global_presence.dim() < 1:
+            ptm_global_presence = ptm_global_presence.unsqueeze(0)
+        if ptm_global_presence.dim() == 1:
+            ptm_global_presence = ptm_global_presence.unsqueeze(-1)
+        
+        # Clamp values to ensure they're in valid range
+        ptm_global_presence = torch.clamp(ptm_global_presence, 0.0, 1.0)
+        
+        # Ensure global PTM offset has matching shape with global presence
+        if ptm_global_offset.dim() > 2:
+            ptm_global_offset = ptm_global_offset.squeeze()
+        if ptm_global_offset.dim() < 1:
+            ptm_global_offset = ptm_global_offset.unsqueeze(0)
+        if ptm_global_offset.dim() == 1:
+            ptm_global_offset = ptm_global_offset.unsqueeze(-1)
+        
+        # Replace any NaN values that might have occurred
+        ptm_local_offset = torch.nan_to_num(ptm_local_offset)
+        ptm_global_offset = torch.nan_to_num(ptm_global_offset)
         
         return {
             'sequence_probs': sequence_probs,
