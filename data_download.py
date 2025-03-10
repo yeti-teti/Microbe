@@ -14,12 +14,3 @@ _ = urllib.request.urlretrieve(url, f"{library_file}.tar.gz")
 
 with tarfile.open(f"{library_file}.tar.gz") as f:
     f.extractall("./datasets/")
-
-
-cf = "casanovo_v4_2_0.ckpt"
-url = "https://github.com/Noble-Lab/casanovo/releases/download/v4.2.0/casanovo_v4_2_0.ckpt"
-
-# Download file
-_ = urllib.request.urlretrieve(url, f"{cf}")
-
-shutil.move("casanovo_v4_2_0.ckpt", "models/casanovo_v4_2_0.ckpt")
