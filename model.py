@@ -122,8 +122,19 @@ class SequenceGenerator(nn.Module):
         super(SequenceGenerator, self).__init__()
         self.proj = nn.Linear(d_model, vocab_size)
     
-    def forward(self, x):
-        return F.log_softmax(self.proj(x), dim=-1)
+    def forward(self, x, temperature=1.0):
+        """
+        Forward pass with optional temperature scaling
+        
+        Args:
+            x: Input tensor
+            temperature: Temperature for softmax (lower = more peaked distribution)
+            
+        Returns:
+            Log probabilities for each vocabulary item
+        """
+        logits = self.proj(x)
+        return F.log_softmax(logits / temperature, dim=-1)
 
 class PTMLocalPredictor(nn.Module):
     """Predicts local PTM presence and mass offset"""
@@ -226,6 +237,11 @@ class Spec2PepWithPTM(nn.Module):
     ):
         super(Spec2PepWithPTM, self).__init__()
         
+        # Save configuration
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+        self.d_model = d_model
+        
         # Encoders
         self.peak_encoder = PeakEncoder(max_peaks, d_model)
         self.precursor_encoder = PrecursorEncoder(d_model)
@@ -249,14 +265,27 @@ class Spec2PepWithPTM(nn.Module):
         self.ptm_local_predictor = PTMLocalPredictor(d_model)
         self.ptm_global_predictor = PTMGlobalPredictor(d_model)
         
-        # Initialize parameters
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        # Initialize parameters with custom initialization
+        self._init_parameters()
     
-    def forward(self, features):
+    def _init_parameters(self):
+        """Initialize model parameters with custom values to prevent mode collapse"""
+        for name, p in self.named_parameters():
+            if p.dim() > 1:
+                # Different initialization based on parameter type
+                if 'proj' in name or 'generator' in name:
+                    # Output projections - more aggressive initialization
+                    nn.init.xavier_uniform_(p, gain=1.4)
+                elif 'embedding' in name or 'token_embedding' in name:
+                    # Embeddings - smaller values
+                    nn.init.normal_(p, mean=0.0, std=0.1)
+                else:
+                    # Default initialization
+                    nn.init.xavier_uniform_(p, gain=1.0)
+    
+    def forward(self, features, teacher_forcing_ratio=1.0, temperature=1.0):
         """
-        Forward pass through the model.
+        Forward pass through the model with optional teacher forcing and temperature scaling.
         
         Args:
             features: Dictionary containing:
@@ -264,6 +293,8 @@ class Spec2PepWithPTM(nn.Module):
                 - 'precursor': Precursor info tensor [batch, 2]
                 - 'input_sequence': Input sequence token IDs [batch, seq_len]
                 - 'attention_mask': Boolean mask for sequence (True = use, False = ignore)
+            teacher_forcing_ratio: Probability of using teacher forcing (1.0 = always use ground truth)
+            temperature: Temperature parameter for softmax (lower = more peaked distribution)
         
         Returns:
             Dictionary of model outputs
@@ -295,35 +326,109 @@ class Spec2PepWithPTM(nn.Module):
         # Set the peaks part of the mask using the mz values
         memory_key_padding_mask[:, 1:] = (peaks_mz == 0)
         
-        # Embed sequence tokens
-        seq_embedded = self.token_embedding(seq_tokens)  # [batch, seq_len, d_model]
-        seq_embedded = self.pos_encoding(seq_embedded)
-        
-        # Create sequence padding mask (True = padding position to be masked)
-        if 'attention_mask' in features:
-            seq_padding_mask = ~features['attention_mask'].to(device)  # Convert from "attend" to "mask"
+        # Determine if we're using teacher forcing or autoregressive decoding
+        if self.training and torch.rand(1).item() <= teacher_forcing_ratio:
+            # Teacher forcing mode - standard transformer decoding
+            
+            # Embed sequence tokens
+            seq_embedded = self.token_embedding(seq_tokens)  # [batch, seq_len, d_model]
+            seq_embedded = self.pos_encoding(seq_embedded)
+            
+            # Create sequence padding mask (True = padding position to be masked)
+            if 'attention_mask' in features:
+                seq_padding_mask = ~features['attention_mask'].to(device)  # Convert from "attend" to "mask"
+            else:
+                seq_padding_mask = None
+            
+            # Create causal mask for autoregressive decoding
+            seq_len = seq_tokens.size(1)
+            tgt_mask = generate_square_subsequent_mask(seq_len, device)
+            
+            # Apply transformer decoder
+            decoder_output = self.transformer_decoder(
+                seq_embedded, 
+                memory,
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=seq_padding_mask
+            )
+            
+            # Generate sequence predictions
+            sequence_probs = self.sequence_generator(decoder_output, temperature)
+            
         else:
-            seq_padding_mask = None
+            # Autoregressive mode - predict one token at a time
+            batch_size = seq_tokens.size(0)
+            seq_len = seq_tokens.size(1)
+            
+            # Initialize output tensors
+            sequence_probs = torch.zeros(batch_size, seq_len, self.vocab_size).to(device)
+            decoder_outputs = torch.zeros(batch_size, seq_len, self.d_model).to(device)
+            
+            # Start with just the first token (usually <sos>)
+            current_input = seq_tokens[:, 0].unsqueeze(1)  # [batch, 1]
+            
+            # Generate sequence autoregressively
+            for t in range(seq_len):
+                # Embed current sequence
+                current_embedded = self.token_embedding(current_input)  # [batch, t+1, d_model]
+                current_embedded = self.pos_encoding(current_embedded)
+                
+                # Create causal mask for current length
+                curr_len = current_input.size(1)
+                curr_mask = generate_square_subsequent_mask(curr_len, device)
+                
+                # Decode current sequence
+                current_output = self.transformer_decoder(
+                    current_embedded,
+                    memory,
+                    tgt_mask=curr_mask,
+                    memory_key_padding_mask=memory_key_padding_mask
+                )
+                
+                # Store decoder output for latest position
+                if t < seq_len:
+                    decoder_outputs[:, t] = current_output[:, -1]
+                
+                # Get prediction probabilities for the latest position
+                current_probs = self.sequence_generator(current_output[:, -1].unsqueeze(1), temperature)
+                
+                # Store predictions
+                if t < seq_len:
+                    sequence_probs[:, t] = current_probs.squeeze(1)
+                
+                # Prepare input for next iteration
+                if t + 1 < seq_len:
+                    # During training, sometimes use the ground truth (teacher forcing)
+                    if self.training and torch.rand(1).item() <= teacher_forcing_ratio:
+                        next_token = seq_tokens[:, t+1].unsqueeze(1)
+                    else:
+                        # Otherwise use model prediction (with optional sampling)
+                        if temperature > 0:
+                            # Sample from distribution
+                            probs = torch.exp(current_probs.squeeze(1))
+                            next_token = torch.multinomial(probs, 1)
+                        else:
+                            # Greedy decoding
+                            next_token = current_probs.argmax(dim=-1).unsqueeze(1)
+                    
+                    # Append next token to current input
+                    current_input = torch.cat([current_input, next_token], dim=1)
+            
+            # Replace decoder_output with our accumulated outputs
+            decoder_output = decoder_outputs
         
-        # Create causal mask for autoregressive decoding
-        seq_len = seq_tokens.size(1)
-        tgt_mask = generate_square_subsequent_mask(seq_len, device)
-        
-        # Apply transformer decoder
-        decoder_output = self.transformer_decoder(
-            seq_embedded, 
-            memory,
-            tgt_mask=tgt_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
-            tgt_key_padding_mask=seq_padding_mask
-        )
-        
-        # Generate outputs
-        sequence_probs = self.sequence_generator(decoder_output)
+        # Generate local PTM predictions
         ptm_local_presence, ptm_local_offset = self.ptm_local_predictor(decoder_output)
+        
+        # Generate global PTM predictions
+        attention_mask = features.get('attention_mask', None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            
         ptm_global_presence, ptm_global_offset = self.ptm_global_predictor(
             decoder_output, 
-            mask=features.get('attention_mask', None).to(device) if features.get('attention_mask', None) is not None else None
+            mask=attention_mask
         )
         
         return {
@@ -332,4 +437,147 @@ class Spec2PepWithPTM(nn.Module):
             'ptm_local_offset': ptm_local_offset,
             'ptm_global_presence': ptm_global_presence,
             'ptm_global_offset': ptm_global_offset
+        }
+    
+    def predict_sequence(self, features, max_length=None, temperature=0.7, top_k=0, top_p=0.9):
+        """
+        Generate a sequence prediction with various decoding strategies.
+        
+        Args:
+            features: Input features dictionary
+            max_length: Maximum sequence length (default: self.max_seq_len)
+            temperature: Temperature for sampling (lower = more peaked, 0 = greedy)
+            top_k: Keep only top k tokens with highest probability (0 = all)
+            top_p: Keep top tokens with cumulative probability >= top_p (1.0 = all)
+            
+        Returns:
+            Dictionary with predictions
+        """
+        if max_length is None:
+            max_length = self.max_seq_len
+            
+        # Get device
+        device = next(self.parameters()).device
+        
+        # Extract inputs and move to device
+        peaks = features['peaks']
+        peaks_mz, peaks_intensity = peaks[0].to(device), peaks[1].to(device)
+        precursor = features['precursor'].to(device)
+        
+        batch_size = peaks_mz.size(0)
+        
+        # Process peaks and precursor
+        peak_encoding = self.peak_encoder(peaks_mz, peaks_intensity)
+        precursor_encoding = self.precursor_encoder(precursor)
+        memory = torch.cat([precursor_encoding, peak_encoding], dim=1)
+        
+        # Create memory padding mask
+        memory_key_padding_mask = torch.zeros(
+            (memory.size(0), memory.size(1)), 
+            device=device,
+            dtype=torch.bool
+        )
+        memory_key_padding_mask[:, 1:] = (peaks_mz == 0)
+        
+        # Start with SOS token (typically index 1 but may vary)
+        # If 'input_sequence' is provided, use its first token, otherwise default to index 1
+        if 'input_sequence' in features:
+            current_input = features['input_sequence'][:, 0].unsqueeze(1).to(device)
+        else:
+            # Assuming SOS token index is 1
+            current_input = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+        
+        # Initialize containers for output
+        all_tokens = [current_input]
+        all_scores = []
+        
+        # Autoregressive generation
+        for step in range(max_length - 1):
+            # Embed current sequence
+            current_embedded = self.token_embedding(current_input)
+            current_embedded = self.pos_encoding(current_embedded)
+            
+            # Create mask
+            curr_len = current_input.size(1)
+            curr_mask = generate_square_subsequent_mask(curr_len, device)
+            
+            # Decode
+            decoder_output = self.transformer_decoder(
+                current_embedded,
+                memory,
+                tgt_mask=curr_mask,
+                memory_key_padding_mask=memory_key_padding_mask
+            )
+            
+            # Get prediction for next token
+            logits = self.sequence_generator.proj(decoder_output[:, -1, :])
+            
+            # Apply temperature
+            if temperature > 0:
+                logits = logits / temperature
+            
+            # Apply softmax to get probabilities
+            scores = F.softmax(logits, dim=-1)
+            
+            # Apply top-k filtering
+            if top_k > 0:
+                indices_to_remove = scores < torch.topk(scores, top_k)[0][..., -1, None]
+                scores[indices_to_remove] = 0
+                
+            # Apply top-p (nucleus) filtering
+            if 0 < top_p < 1.0:
+                sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+                cumulative_probs = torch.cumsum(sorted_scores, dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep first probs above threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Create a mask for indices to remove
+                indices_to_remove = torch.zeros_like(scores, dtype=torch.bool)
+                indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+                scores[indices_to_remove] = 0
+            
+            # Renormalize probabilities if needed
+            if top_k > 0 or 0 < top_p < 1.0:
+                scores = scores / scores.sum(dim=-1, keepdim=True)
+            
+            # Sample from the filtered distribution
+            if temperature > 0:
+                next_token = torch.multinomial(scores, num_samples=1)
+            else:
+                # Greedy decoding
+                next_token = torch.argmax(scores, dim=-1).unsqueeze(-1)
+            
+            # Append to outputs
+            all_tokens.append(next_token)
+            all_scores.append(scores)
+            
+            # Update input for next iteration
+            current_input = torch.cat([current_input, next_token], dim=1)
+        
+        # Process all predictions
+        all_tokens = torch.cat(all_tokens, dim=1)  # [batch, max_length]
+        
+        # Generate a full forward pass with the final sequence to get PTM predictions
+        features_updated = {
+            'peaks': features['peaks'],
+            'precursor': features['precursor'],
+            'input_sequence': all_tokens,
+            'attention_mask': torch.ones_like(all_tokens, dtype=torch.bool)
+        }
+        
+        # Run inference with the predicted sequence
+        with torch.no_grad():
+            outputs = self.forward(features_updated, teacher_forcing_ratio=1.0)
+        
+        return {
+            'predicted_tokens': all_tokens,
+            'sequence_probs': outputs['sequence_probs'],
+            'ptm_local_presence': outputs['ptm_local_presence'],
+            'ptm_local_offset': outputs['ptm_local_offset'],
+            'ptm_global_presence': outputs['ptm_global_presence'],
+            'ptm_global_offset': outputs['ptm_global_offset']
         }

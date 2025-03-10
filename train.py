@@ -1,12 +1,12 @@
 import os
 import time
 import argparse
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
@@ -38,12 +38,25 @@ def parse_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps for learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
     parser.add_argument("--patience", type=int, default=5, help="Patience for early stopping")
+    parser.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing factor")
     parser.add_argument("--seq_loss_weight", type=float, default=1.0, help="Weight for sequence loss")
     parser.add_argument("--ptm_local_loss_weight", type=float, default=0.5, help="Weight for local PTM loss")
     parser.add_argument("--ptm_global_loss_weight", type=float, default=0.5, help="Weight for global PTM loss")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm")
+    
+    # Scheduled sampling parameters
+    parser.add_argument("--teacher_forcing_start", type=float, default=1.0, 
+                        help="Initial teacher forcing ratio")
+    parser.add_argument("--teacher_forcing_end", type=float, default=0.5, 
+                        help="Final teacher forcing ratio")
+    
+    # Generation parameters
+    parser.add_argument("--temperature", type=float, default=0.8, 
+                        help="Temperature for sequence generation")
     
     # Other parameters
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -51,6 +64,7 @@ def parse_args():
                         help="Device to use (cuda/mps/cpu)")
     parser.add_argument("--log_interval", type=int, default=10, help="Logging interval (batches)")
     parser.add_argument("--save_interval", type=int, default=1, help="Saving interval (epochs)")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     
     return parser.parse_args()
 
@@ -62,7 +76,7 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def calculate_loss(outputs, targets, loss_weights, pad_idx=0):
+def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.1):
     """
     Calculate the combined loss.
     
@@ -71,13 +85,17 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0):
         targets: Target outputs dictionary
         loss_weights: Dictionary of loss weights
         pad_idx: Index of padding token (to be ignored in sequence loss)
+        label_smoothing: Label smoothing factor for cross-entropy
         
     Returns:
         total_loss: Combined weighted loss
         loss_info: Dictionary of individual loss components
     """
-    # Sequence prediction loss (cross-entropy)
-    seq_loss = nn.CrossEntropyLoss(ignore_index=pad_idx)(
+    # Sequence prediction loss (cross-entropy with label smoothing)
+    seq_loss = nn.CrossEntropyLoss(
+        ignore_index=pad_idx, 
+        label_smoothing=label_smoothing
+    )(
         outputs['sequence_probs'].view(-1, outputs['sequence_probs'].size(-1)),
         targets['target_sequence'].view(-1)
     )
@@ -151,7 +169,140 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0):
     
     return total_loss, loss_info
 
-def evaluate(model, dataloader, loss_weights, device, pad_idx=0):
+def get_lr_scheduler(optimizer, warmup_steps=2000, total_steps=100000):
+    """
+    Create a learning rate scheduler with linear warmup and cosine decay.
+    
+    Args:
+        optimizer: The optimizer
+        warmup_steps: Number of warmup steps
+        total_steps: Total number of training steps
+        
+    Returns:
+        LambdaLR scheduler
+    """
+    def lr_lambda(step):
+        # Linear warmup
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        
+        # Cosine decay
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+def train_one_epoch(
+    model, 
+    dataloader, 
+    optimizer, 
+    scheduler, 
+    loss_weights, 
+    device, 
+    pad_idx=0, 
+    log_interval=10, 
+    max_grad_norm=1.0,
+    label_smoothing=0.1,
+    teacher_forcing_ratio=1.0,
+    temperature=1.0
+):
+    """
+    Train the model for one epoch.
+    
+    Args:
+        model: The model to train
+        dataloader: DataLoader with training data
+        optimizer: Optimizer
+        scheduler: Learning rate scheduler
+        loss_weights: Dictionary of loss weights
+        device: Device to use
+        pad_idx: Index of padding token
+        log_interval: How often to log progress
+        max_grad_norm: Maximum gradient norm for clipping
+        label_smoothing: Label smoothing factor
+        teacher_forcing_ratio: Probability of using teacher forcing
+        temperature: Temperature for sequence generation
+        
+    Returns:
+        avg_loss: Average loss over the epoch
+        loss_info: Dictionary of average loss components
+    """
+    model.train()
+    total_loss = 0
+    loss_info_sum = {
+        'total': 0,
+        'seq': 0,
+        'ptm_local_presence': 0, 
+        'ptm_local_offset': 0,
+        'ptm_global_presence': 0,
+        'ptm_global_offset': 0
+    }
+    
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn()
+    ) as progress:
+        train_task = progress.add_task("Training", total=len(dataloader))
+        
+        for batch_idx, (features, targets) in enumerate(dataloader):
+            # Forward pass
+            outputs = model(
+                features, 
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                temperature=temperature
+            )
+            
+            # Calculate loss
+            loss, batch_loss_info = calculate_loss(
+                outputs, 
+                targets, 
+                loss_weights, 
+                pad_idx, 
+                label_smoothing
+            )
+            
+            # Backward pass and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Apply gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            # Accumulate losses
+            for k, v in batch_loss_info.items():
+                loss_info_sum[k] += v
+            
+            # Update progress
+            progress.update(train_task, advance=1)
+            
+            # Log progress
+            if batch_idx % log_interval == 0:
+                progress.console.log(f"Batch {batch_idx}/{len(dataloader)}, Loss: {batch_loss_info['total']:.4f}")
+                
+                # Analyze predictions for one batch periodically
+                if batch_idx % (log_interval * 5) == 0:
+                    analyze_predictions(progress.console, model, features, targets, dataloader.dataset.id_to_aa)
+    
+    # Calculate averages
+    batch_count = len(dataloader)
+    avg_loss_info = {k: v / batch_count for k, v in loss_info_sum.items()}
+    
+    return avg_loss_info['total'], avg_loss_info
+
+def evaluate(
+    model, 
+    dataloader, 
+    loss_weights, 
+    device, 
+    pad_idx=0, 
+    label_smoothing=0.1,
+    temperature=1.0
+):
     """
     Evaluate the model on the given dataloader.
     
@@ -159,8 +310,10 @@ def evaluate(model, dataloader, loss_weights, device, pad_idx=0):
         model: The model to evaluate
         dataloader: DataLoader to use for evaluation
         loss_weights: Dictionary of loss weights
-        device: Device to use for tensors
+        device: Device to use
         pad_idx: Index of padding token
+        label_smoothing: Label smoothing factor
+        temperature: Temperature for sequence generation
         
     Returns:
         avg_loss: Average loss over the dataset
@@ -179,17 +332,17 @@ def evaluate(model, dataloader, loss_weights, device, pad_idx=0):
     
     with torch.no_grad():
         for features, targets in dataloader:
-            # Move data to device
-            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                       (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                       for k, v in features.items()}
-            targets = {k: v.to(device) for k, v in targets.items()}
-            
             # Forward pass
-            outputs = model(features)
+            outputs = model(features, teacher_forcing_ratio=1.0, temperature=temperature)
             
             # Calculate loss
-            _, batch_loss_info = calculate_loss(outputs, targets, loss_weights, pad_idx)
+            _, batch_loss_info = calculate_loss(
+                outputs, 
+                targets, 
+                loss_weights, 
+                pad_idx, 
+                label_smoothing
+            )
             
             # Accumulate losses
             for k, v in batch_loss_info.items():
@@ -217,7 +370,7 @@ def decode_sequence(id_to_aa, sequence_ids):
         sequence_ids = sequence_ids.cpu().tolist()
     
     # Decode to amino acids
-    amino_acids = [id_to_aa[idx] for idx in sequence_ids]
+    amino_acids = [id_to_aa.get(idx, '_') for idx in sequence_ids]
     
     # Remove special tokens
     valid_aas = []
@@ -228,78 +381,56 @@ def decode_sequence(id_to_aa, sequence_ids):
     
     return ''.join(valid_aas)
 
-def train_one_epoch(model, dataloader, optimizer, loss_weights, device, pad_idx=0, log_interval=10):
+def analyze_predictions(console, model, features, targets, id_to_aa):
     """
-    Train the model for one epoch.
+    Analyze model predictions to check diversity.
     
     Args:
-        model: The model to train
-        dataloader: DataLoader with training data
-        optimizer: Optimizer to use
-        loss_weights: Dictionary of loss weights
-        device: Device to use for tensors
-        pad_idx: Index of padding token
-        log_interval: How often to log progress
-        
-    Returns:
-        avg_loss: Average loss over the epoch
-        loss_info: Dictionary of average loss components
+        console: Rich console for output
+        model: The model
+        features: Batch features
+        targets: Batch targets
+        id_to_aa: ID to amino acid mapping
     """
-    model.train()
-    total_loss = 0
-    loss_info_sum = {
-        'total': 0,
-        'seq': 0,
-        'ptm_local_presence': 0, 
-        'ptm_local_offset': 0,
-        'ptm_global_presence': 0,
-        'ptm_global_offset': 0
-    }
+    model.eval()
     
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn()
-    ) as progress:
-        train_task = progress.add_task("Training", total=len(dataloader))
+    with torch.no_grad():
+        # Get device
+        device = next(model.parameters()).device
         
-        for batch_idx, (features, targets) in enumerate(dataloader):
-            # Move data to device
-            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                       (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                       for k, v in features.items()}
-            targets = {k: v.to(device) for k, v in targets.items()}
+        # Move data to device
+        features_device = {k: v.to(device) if isinstance(v, torch.Tensor) else 
+                          (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
+                          for k, v in features.items()}
+        
+        # Forward pass with different temperatures
+        outputs_cold = model(features_device, teacher_forcing_ratio=0.0, temperature=0.5)
+        outputs_normal = model(features_device, teacher_forcing_ratio=0.0, temperature=1.0)
+        
+        # Get predictions
+        pred_cold = outputs_cold['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
+        pred_normal = outputs_normal['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
+        
+        # Count unique amino acids for the first few examples
+        n_examples = min(5, len(pred_cold))
+        
+        aa_counts = {}
+        for i in range(n_examples):
+            seq_cold = decode_sequence(id_to_aa, pred_cold[i])
+            seq_normal = decode_sequence(id_to_aa, pred_normal[i])
+            true_seq = decode_sequence(id_to_aa, targets['target_sequence'][i])
             
-            # Clear gradients
-            optimizer.zero_grad()
+            for aa in seq_cold:
+                if aa not in aa_counts:
+                    aa_counts[aa] = 0
+                aa_counts[aa] += 1
             
-            # Forward pass
-            outputs = model(features)
-            
-            # Calculate loss
-            loss, batch_loss_info = calculate_loss(outputs, targets, loss_weights, pad_idx)
-            
-            # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
-            
-            # Accumulate losses
-            for k, v in batch_loss_info.items():
-                loss_info_sum[k] += v
-            
-            # Update progress
-            progress.update(train_task, advance=1)
-            
-            # Log progress
-            if batch_idx % log_interval == 0:
-                progress.console.log(f"Batch {batch_idx}/{len(dataloader)}, Loss: {batch_loss_info['total']:.4f}")
+            console.print(f"Example {i+1}:")
+            console.print(f"  True:    {true_seq}")
+            console.print(f"  Cold:    {seq_cold}")
+            console.print(f"  Normal:  {seq_normal}")
     
-    # Calculate averages
-    batch_count = len(dataloader)
-    avg_loss_info = {k: v / batch_count for k, v in loss_info_sum.items()}
-    
-    return avg_loss_info['total'], avg_loss_info
+    console.print(f"Amino acid distribution in predictions: {sorted(aa_counts.items())}")
 
 def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
     """
@@ -329,8 +460,8 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
                        for k, v in features.items()}
             targets = {k: v.to(device) for k, v in targets.items()}
             
-            # Forward pass
-            outputs = model(features)
+            # Forward pass with lower temperature
+            outputs = model(features, teacher_forcing_ratio=0.0, temperature=0.7)
             
             # Get predictions
             pred_sequence = outputs['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
@@ -403,24 +534,32 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
     
     return table
 
-def save_checkpoint(model, optimizer, epoch, loss_info, filename):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss_info, filename):
     """Save checkpoint to file."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'loss_info': loss_info
     }
     torch.save(checkpoint, filename)
     console.log(f"Checkpoint saved to {filename}")
 
-def load_checkpoint(model, optimizer, filename):
+def load_checkpoint(model, optimizer, scheduler, filename):
     """Load checkpoint from file."""
+    console.log(f"Loading checkpoint from {filename}")
+    
     checkpoint = torch.load(filename)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
     start_epoch = checkpoint['epoch'] + 1
     console.log(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+    
     return start_epoch
 
 def train_model(args):
@@ -478,8 +617,11 @@ def train_model(args):
     # Setup optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Setup scheduler
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    # Calculate total steps for scheduler
+    total_steps = len(train_loader) * args.epochs
+    
+    # Setup scheduler with warmup
+    scheduler = get_lr_scheduler(optimizer, args.warmup_steps, total_steps)
     
     # Setup tensorboard
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
@@ -499,23 +641,38 @@ def train_model(args):
     
     # Check if resume from checkpoint
     checkpoint_path = os.path.join(args.output_dir, 'checkpoint.pt')
-    if os.path.exists(checkpoint_path):
-        if console.input("[yellow]Found existing checkpoint. Resume training? (y/n)[/yellow] ").lower() == 'y':
-            start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
+    if args.resume and os.path.exists(checkpoint_path):
+        start_epoch = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
     
     for epoch in range(start_epoch, args.epochs):
         console.log(f"[bold]Epoch {epoch+1}/{args.epochs}[/bold]")
         
+        # Calculate teacher forcing ratio for this epoch using linear annealing
+        teacher_forcing_ratio = max(
+            args.teacher_forcing_end,
+            args.teacher_forcing_start - (args.teacher_forcing_start - args.teacher_forcing_end) * 
+            (epoch / args.epochs)
+        )
+        console.log(f"Teacher forcing ratio: {teacher_forcing_ratio:.2f}")
+        
         # Train for one epoch
         train_loss, train_loss_info = train_one_epoch(
-            model, train_loader, optimizer, loss_weights, device, pad_idx, args.log_interval
+            model, train_loader, optimizer, scheduler, loss_weights, device,
+            pad_idx=pad_idx, 
+            log_interval=args.log_interval,
+            max_grad_norm=args.max_grad_norm,
+            label_smoothing=args.label_smoothing,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            temperature=args.temperature
         )
         
         # Evaluate on validation set
-        val_loss, val_loss_info = evaluate(model, val_loader, loss_weights, device, pad_idx)
-        
-        # Update scheduler
-        scheduler.step(val_loss)
+        val_loss, val_loss_info = evaluate(
+            model, val_loader, loss_weights, device, 
+            pad_idx=pad_idx,
+            label_smoothing=args.label_smoothing,
+            temperature=args.temperature
+        )
         
         # Log metrics
         console.log(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
@@ -523,10 +680,13 @@ def train_model(args):
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Teacher_Forcing_Ratio', teacher_forcing_ratio, epoch)
+        
         for k, v in train_loss_info.items():
             if k == 'total':
                 continue
             writer.add_scalar(f'LossComponents/train_{k}', v, epoch)
+        
         for k, v in val_loss_info.items():
             if k == 'total':
                 continue
@@ -535,7 +695,7 @@ def train_model(args):
         # Save checkpoint
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(
-                model, optimizer, epoch,
+                model, optimizer, scheduler, epoch,
                 {'train': train_loss_info, 'val': val_loss_info},
                 os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
             )
@@ -545,7 +705,7 @@ def train_model(args):
             best_val_loss = val_loss
             patience_counter = 0
             save_checkpoint(
-                model, optimizer, epoch,
+                model, optimizer, scheduler, epoch,
                 {'train': train_loss_info, 'val': val_loss_info},
                 os.path.join(args.output_dir, 'best_model.pt')
             )
@@ -558,7 +718,7 @@ def train_model(args):
         
         # Save latest checkpoint
         save_checkpoint(
-            model, optimizer, epoch,
+            model, optimizer, scheduler, epoch,
             {'train': train_loss_info, 'val': val_loss_info},
             checkpoint_path
         )
@@ -573,7 +733,11 @@ def train_model(args):
     
     # Final evaluation
     console.log("Final evaluation...")
-    test_loss, test_loss_info = evaluate(model, val_loader, loss_weights, device, pad_idx)
+    test_loss, test_loss_info = evaluate(
+        model, val_loader, loss_weights, device, 
+        pad_idx=pad_idx,
+        label_smoothing=args.label_smoothing
+    )
     console.log(f"Test Loss: {test_loss:.4f}")
     
     # Visualize final predictions
@@ -583,7 +747,7 @@ def train_model(args):
     
     # Save final model
     save_checkpoint(
-        model, optimizer, args.epochs - 1,
+        model, optimizer, scheduler, args.epochs - 1,
         {'val': test_loss_info},
         os.path.join(args.output_dir, 'final_model.pt')
     )
