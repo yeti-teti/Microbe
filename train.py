@@ -79,7 +79,7 @@ def set_seed(seed):
 
 def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.1):
     """
-    Calculate the combined loss with improved error handling.
+    Calculate the combined loss with improved error handling and value clamping.
     
     Args:
         outputs: Model outputs dictionary
@@ -92,147 +92,69 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.
         total_loss: Combined weighted loss
         loss_info: Dictionary of individual loss components
     """
-    loss_components = {}
+    # Sequence prediction loss (cross-entropy with label smoothing)
+    seq_loss = nn.CrossEntropyLoss(
+        ignore_index=pad_idx, 
+        label_smoothing=label_smoothing
+    )(
+        outputs['sequence_probs'].reshape(-1, outputs['sequence_probs'].size(-1)),
+        targets['target_sequence'].reshape(-1)
+    )
     
-    try:
-        # Sequence prediction loss (cross-entropy with label smoothing)
-        seq_loss = nn.CrossEntropyLoss(
-            ignore_index=pad_idx, 
-            label_smoothing=label_smoothing
-        )(
-            outputs['sequence_probs'].reshape(-1, outputs['sequence_probs'].size(-1)),
-            targets['target_sequence'].reshape(-1)
-        )
-        loss_components['seq'] = seq_loss
-        
-        # Local PTM prediction loss - with clamping for numerical stability
-        # Ensure values are between 0 and 1 for BCE loss
-        ptm_local_presence = torch.clamp(outputs['ptm_local_presence'], 0.0, 1.0)
-        ptm_local_presence_loss = nn.BCELoss()(
-            ptm_local_presence.reshape(-1),
-            targets['ptm_presence'].reshape(-1)
-        )
-        loss_components['ptm_local_presence'] = ptm_local_presence_loss
-        
-        # Only compute offset loss for positions with PTMs
-        ptm_mask = targets['ptm_presence'].float()
-        
-        # Safe masking for offset loss
-        safe_pred_offset = outputs['ptm_local_offset'].clone() * ptm_mask
-        safe_target_offset = targets['ptm_offset'].clone() * ptm_mask
-        
-        # Replace any NaN values with zeros
-        safe_pred_offset = torch.nan_to_num(safe_pred_offset, nan=0.0, posinf=0.0, neginf=0.0)
-        safe_target_offset = torch.nan_to_num(safe_target_offset, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        ptm_local_offset_loss = nn.MSELoss()(safe_pred_offset, safe_target_offset)
-        loss_components['ptm_local_offset'] = ptm_local_offset_loss
-        
-        # Global PTM prediction loss - ensure tensor shapes match and values are in range
-        global_ptm_presence_output = outputs['ptm_global_presence']
-        global_ptm_presence_target = targets['global_ptm_presence']
-        
-        # Handle dimension mismatches for global presence
-        if global_ptm_presence_output.dim() != global_ptm_presence_target.dim():
-            if global_ptm_presence_output.dim() > global_ptm_presence_target.dim():
-                global_ptm_presence_output = global_ptm_presence_output.squeeze()
-            else:
-                global_ptm_presence_target = global_ptm_presence_target.squeeze()
-        
-        # Ensure both have the same shape for broadcasting
-        if global_ptm_presence_output.shape != global_ptm_presence_target.shape:
-            # If shapes still don't match after squeeze, try to reshape
-            global_ptm_presence_output = global_ptm_presence_output.reshape(global_ptm_presence_target.shape)
-        
-        # Clamp values for numerical stability
-        global_ptm_presence_output = torch.clamp(global_ptm_presence_output, 0.0, 1.0)
-        
-        ptm_global_presence_loss = nn.BCELoss()(
-            global_ptm_presence_output,
-            global_ptm_presence_target
-        )
-        loss_components['ptm_global_presence'] = ptm_global_presence_loss
-        
-        # Global offset loss - ensure tensor shapes match
-        global_ptm_offset_output = outputs['ptm_global_offset']
-        global_ptm_offset_target = targets['global_ptm_offset']
-        
-        # Handle dimension mismatches for global offset
-        if global_ptm_offset_output.dim() != global_ptm_offset_target.dim():
-            if global_ptm_offset_output.dim() > global_ptm_offset_target.dim():
-                global_ptm_offset_output = global_ptm_offset_output.squeeze()
-            else:
-                global_ptm_offset_target = global_ptm_offset_target.squeeze()
-        
-        # Ensure both have the same shape for broadcasting
-        if global_ptm_offset_output.shape != global_ptm_offset_target.shape:
-            # If shapes still don't match, try to reshape
-            global_ptm_offset_output = global_ptm_offset_output.reshape(global_ptm_offset_target.shape)
-        
-        # Create a safer version of the global presence mask
-        global_presence_mask = targets['global_ptm_presence'].float()
-        if global_presence_mask.dim() > 1:
-            global_presence_mask = global_presence_mask.squeeze()
-            
-        # Apply global PTM presence mask safely
-        masked_global_offset_output = global_ptm_offset_output * global_presence_mask
-        masked_global_offset_target = global_ptm_offset_target * global_presence_mask
-        
-        # Replace any NaN values with zeros
-        masked_global_offset_output = torch.nan_to_num(masked_global_offset_output, nan=0.0, posinf=0.0, neginf=0.0)
-        masked_global_offset_target = torch.nan_to_num(masked_global_offset_target, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        ptm_global_offset_loss = nn.MSELoss()(
-            masked_global_offset_output,
-            masked_global_offset_target
-        )
-        loss_components['ptm_global_offset'] = ptm_global_offset_loss
-        
-        # Combine all losses with weights
-        total_loss = (
-            loss_weights['seq'] * loss_components['seq'] +
-            loss_weights['ptm_local'] * (loss_components['ptm_local_presence'] + loss_components['ptm_local_offset']) +
-            loss_weights['ptm_global'] * (loss_components['ptm_global_presence'] + loss_components['ptm_global_offset'])
-        )
-        
-        # Return loss info for logging
-        loss_info = {
-            'total': total_loss.item(),
-            'seq': loss_components['seq'].item(),
-            'ptm_local_presence': loss_components['ptm_local_presence'].item(),
-            'ptm_local_offset': loss_components['ptm_local_offset'].item(),
-            'ptm_global_presence': loss_components['ptm_global_presence'].item(),
-            'ptm_global_offset': loss_components['ptm_global_offset'].item()
-        }
-        
-        return total_loss, loss_info
+    # CRITICAL FIX: Ensure values are strictly between 0 and 1 for BCE loss
+    # For local PTM presence prediction
+    safe_ptm_local_presence = torch.clamp(outputs['ptm_local_presence'], 1e-6, 1.0 - 1e-6)
     
-    except Exception as e:
-        # Print diagnostic information on error
-        print("\n==== ERROR IN LOSS CALCULATION ====")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Error message: {str(e)}")
-        
-        # Print tensor shapes for debugging
-        print("\n==== TENSOR SHAPES ====")
-        print(f"sequence_probs shape: {outputs['sequence_probs'].shape}")
-        print(f"target_sequence shape: {targets['target_sequence'].shape}")
-        print(f"ptm_local_presence shape: {outputs['ptm_local_presence'].shape}")
-        print(f"ptm_presence shape: {targets['ptm_presence'].shape}")
-        print(f"ptm_local_offset shape: {outputs['ptm_local_offset'].shape}")
-        print(f"ptm_offset shape: {targets['ptm_offset'].shape}")
-        print(f"ptm_global_presence shape: {outputs['ptm_global_presence'].shape}")
-        print(f"global_ptm_presence shape: {targets['global_ptm_presence'].shape}")
-        print(f"ptm_global_offset shape: {outputs['ptm_global_offset'].shape}")
-        print(f"global_ptm_offset shape: {targets['global_ptm_offset'].shape}")
-        
-        # Check for NaN/Inf values
-        for key, tensor in outputs.items():
-            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                print(f"WARNING: {key} contains NaN or Inf values!")
-        
-        # Re-raise the exception
-        raise
+    ptm_local_presence_loss = nn.BCELoss()(
+        safe_ptm_local_presence.reshape(-1),
+        targets['ptm_presence'].reshape(-1)
+    )
+    
+    # Only compute offset loss for positions with PTMs
+    ptm_mask = targets['ptm_presence'].float()
+    ptm_local_offset_loss = nn.MSELoss()(
+        outputs['ptm_local_offset'] * ptm_mask,
+        targets['ptm_offset'] * ptm_mask
+    )
+    
+    # For global PTM presence prediction
+    safe_ptm_global_presence = torch.clamp(outputs['ptm_global_presence'], 1e-6, 1.0 - 1e-6)
+    
+    ptm_global_presence_loss = nn.BCELoss()(
+        safe_ptm_global_presence.reshape(-1),
+        targets['global_ptm_presence'].reshape(-1)
+    )
+    
+    # Global offset loss
+    global_presence_mask = targets['global_ptm_presence'].float()
+    
+    # Apply global PTM presence mask
+    masked_global_offset_output = outputs['ptm_global_offset'] * global_presence_mask
+    masked_global_offset_target = targets['global_ptm_offset'] * global_presence_mask
+    
+    ptm_global_offset_loss = nn.MSELoss()(
+        masked_global_offset_output,
+        masked_global_offset_target
+    )
+    
+    # Combine all losses with weights
+    total_loss = (
+        loss_weights['seq'] * seq_loss +
+        loss_weights['ptm_local'] * (ptm_local_presence_loss + ptm_local_offset_loss) +
+        loss_weights['ptm_global'] * (ptm_global_presence_loss + ptm_global_offset_loss)
+    )
+    
+    # Return loss info for logging
+    loss_info = {
+        'total': total_loss.item(),
+        'seq': seq_loss.item(),
+        'ptm_local_presence': ptm_local_presence_loss.item(),
+        'ptm_local_offset': ptm_local_offset_loss.item(),
+        'ptm_global_presence': ptm_global_presence_loss.item(),
+        'ptm_global_offset': ptm_global_offset_loss.item()
+    }
+    
+    return total_loss, loss_info
 
 def get_lr_scheduler(optimizer, warmup_steps=2000, total_steps=100000):
     """
@@ -257,6 +179,60 @@ def get_lr_scheduler(optimizer, warmup_steps=2000, total_steps=100000):
     
     return LambdaLR(optimizer, lr_lambda)
 
+def validate_tensors(outputs, targets):
+    """
+    Check tensor values and shapes for issues before loss calculation.
+    
+    Args:
+        outputs: Model outputs dictionary
+        targets: Target outputs dictionary
+        
+    Returns:
+        valid: True if all checks pass, False otherwise
+        message: Error message if validation fails
+    """
+    # Check for NaN or Inf values
+    for key, tensor in outputs.items():
+        if torch.isnan(tensor).any():
+            return False, f"NaN values detected in outputs['{key}']"
+        if torch.isinf(tensor).any():
+            return False, f"Inf values detected in outputs['{key}']"
+    
+    # Check probability ranges
+    for key in ['ptm_local_presence', 'ptm_global_presence']:
+        if key in outputs:
+            tensor = outputs[key]
+            min_val = tensor.min().item()
+            max_val = tensor.max().item()
+            if min_val < 0 or max_val > 1:
+                return False, f"Values out of range [0,1] in outputs['{key}']: min={min_val}, max={max_val}"
+    
+    # Check shape compatibilities
+    shape_pairs = [
+        ('sequence_probs', 'target_sequence'),
+        ('ptm_local_presence', 'ptm_presence'),
+        ('ptm_local_offset', 'ptm_offset'),
+        ('ptm_global_presence', 'global_ptm_presence'),
+        ('ptm_global_offset', 'global_ptm_offset')
+    ]
+    
+    for out_key, target_key in shape_pairs:
+        if out_key == 'sequence_probs':
+            # Special case for sequence probs which has vocab dimension
+            if outputs[out_key].size(0) != targets[target_key].size(0) or \
+               outputs[out_key].size(1) != targets[target_key].size(1):
+                return False, f"Shape mismatch: outputs['{out_key}'] {outputs[out_key].shape} vs targets['{target_key}'] {targets[target_key].shape}"
+        else:
+            # For all other tensors, check if shapes are broadcastable
+            try:
+                # This is a simple check - we're just making sure no errors occur
+                # when adding the tensors together (which requires broadcastable shapes)
+                _ = outputs[out_key] + torch.zeros_like(targets[target_key])
+            except:
+                return False, f"Shapes not broadcastable: outputs['{out_key}'] {outputs[out_key].shape} vs targets['{target_key}'] {targets[target_key].shape}"
+    
+    return True, "All checks passed"
+
 def train_one_epoch(
     model, 
     dataloader, 
@@ -272,7 +248,7 @@ def train_one_epoch(
     temperature=1.0
 ):
     """
-    Train the model for one epoch.
+    Train the model for one epoch with enhanced error handling.
     
     Args:
         model: The model to train
@@ -303,6 +279,10 @@ def train_one_epoch(
         'ptm_global_offset': 0
     }
     
+    # Keep track of successful and failed batches
+    successful_batches = 0
+    failed_batches = 0
+    
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -312,56 +292,99 @@ def train_one_epoch(
         train_task = progress.add_task("Training", total=len(dataloader))
         
         for batch_idx, (features, targets) in enumerate(dataloader):
-            # Move features to device
-            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                      (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                      for k, v in features.items()}
-            
-            # Move targets to device
-            targets = {k: v.to(device) for k, v in targets.items()}
-            
-            # Forward pass
-            outputs = model(
-                features, 
-                teacher_forcing_ratio=teacher_forcing_ratio,
-                temperature=temperature
-            )
-            
-            # Calculate loss
-            loss, batch_loss_info = calculate_loss(
-                outputs, 
-                targets, 
-                loss_weights, 
-                pad_idx, 
-                label_smoothing
-            )
-            
-            # Backward pass and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            
-            optimizer.step()
-            scheduler.step()
-            
-            # Accumulate losses
-            for k, v in batch_loss_info.items():
-                loss_info_sum[k] += v
-            
-            # Update progress
-            progress.update(train_task, advance=1)
-            
-            # Log progress (only basic info during batches)
-            if batch_idx % log_interval == 0:
-                progress.console.log(f"Batch {batch_idx}/{len(dataloader)}, Loss: {batch_loss_info['total']:.4f}")
+            try:
+                # Move features to device
+                features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
+                          (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
+                          for k, v in features.items()}
+                
+                # Move targets to device
+                targets = {k: v.to(device) for k, v in targets.items()}
+                
+                # Forward pass
+                outputs = model(
+                    features, 
+                    teacher_forcing_ratio=teacher_forcing_ratio,
+                    temperature=temperature
+                )
+                
+                # Validate tensors before loss calculation
+                valid, message = validate_tensors(outputs, targets)
+                if not valid:
+                    progress.console.log(f"[yellow]Batch {batch_idx} validation failed: {message}[/yellow]")
+                    
+                    # Apply emergency fixes to the outputs
+                    if 'ptm_local_presence' in outputs:
+                        outputs['ptm_local_presence'] = torch.clamp(outputs['ptm_local_presence'], 1e-6, 1.0 - 1e-6)
+                    
+                    if 'ptm_global_presence' in outputs:
+                        outputs['ptm_global_presence'] = torch.clamp(outputs['ptm_global_presence'], 1e-6, 1.0 - 1e-6)
+                    
+                    # Revalidate after fixes
+                    valid, message = validate_tensors(outputs, targets)
+                    if not valid:
+                        progress.console.log(f"[red]Emergency fixes failed: {message}. Skipping batch.[/red]")
+                        failed_batches += 1
+                        progress.update(train_task, advance=1)
+                        continue
+                    
+                    progress.console.log(f"[green]Emergency fixes applied successfully.[/green]")
+                
+                # Calculate loss
+                loss, batch_loss_info = calculate_loss(
+                    outputs, 
+                    targets, 
+                    loss_weights, 
+                    pad_idx, 
+                    label_smoothing
+                )
+                
+                # Backward pass and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                # Accumulate losses
+                for k, v in batch_loss_info.items():
+                    loss_info_sum[k] += v
+                
+                successful_batches += 1
+                
+                # Update progress
+                progress.update(train_task, advance=1)
+                
+                # Log progress
+                if batch_idx % log_interval == 0:
+                    lr = optimizer.param_groups[0]['lr']
+                    progress.console.log(f"Batch {batch_idx}/{len(dataloader)}, Loss: {batch_loss_info['total']:.4f}, LR: {lr:.6f}")
+                
+            except Exception as e:
+                failed_batches += 1
+                progress.console.log(f"[red]Error in batch {batch_idx}: {type(e).__name__}: {str(e)}[/red]")
+                progress.update(train_task, advance=1)
+                
+                # Print more detailed information for debugging
+                import traceback
+                traceback.print_exc()
+                
+                # Continue with next batch
+                continue
     
-    # Calculate averages
-    batch_count = len(dataloader)
-    avg_loss_info = {k: v / batch_count for k, v in loss_info_sum.items()}
-    
-    return avg_loss_info['total'], avg_loss_info
+    # Calculate averages (based on successful batches only)
+    if successful_batches > 0:
+        avg_loss_info = {k: v / successful_batches for k, v in loss_info_sum.items()}
+        print(f"Epoch complete: {successful_batches} successful batches, {failed_batches} failed batches")
+        
+        return avg_loss_info['total'], avg_loss_info
+    else:
+        print(f"[red]WARNING: All {failed_batches} batches failed in this epoch![/red]")
+        # Return dummy values
+        return float('inf'), {k: float('inf') for k in loss_info_sum}
 
 
 def evaluate(

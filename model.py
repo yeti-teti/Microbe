@@ -140,18 +140,15 @@ class PTMLocalPredictor(nn.Module):
     """Predicts local PTM presence and mass offset"""
     def __init__(self, d_model):
         super(PTMLocalPredictor, self).__init__()
-        self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
-            nn.ReLU(),
-            nn.Linear(d_model//2, 1),
-            nn.Sigmoid()
-        )
+        # For presence prediction
+        self.presence_hidden = nn.Linear(d_model, d_model//2)
+        self.presence_act = nn.ReLU()
+        self.presence_out = nn.Linear(d_model//2, 1)
         
-        self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
-            nn.ReLU(),
-            nn.Linear(d_model//2, 1)
-        )
+        # For offset prediction
+        self.offset_hidden = nn.Linear(d_model, d_model//2)
+        self.offset_act = nn.ReLU()
+        self.offset_out = nn.Linear(d_model//2, 1)
     
     def forward(self, x):
         """
@@ -162,8 +159,18 @@ class PTMLocalPredictor(nn.Module):
             ptm_presence: Probability of PTM at each position [batch, seq_len]
             ptm_offset: Predicted mass shift at each position [batch, seq_len]
         """
-        ptm_presence = self.ptm_presence(x).squeeze(-1)
-        ptm_offset = self.ptm_offset(x).squeeze(-1)
+        # For presence prediction - apply layers separately to control value range
+        presence_hidden = self.presence_act(self.presence_hidden(x))
+        presence_logits = self.presence_out(presence_hidden).squeeze(-1)
+        
+        # Apply sigmoid and then strictly clamp values to prevent assertion errors
+        ptm_presence = torch.sigmoid(presence_logits)
+        # Clamp to ensure values are strictly between 0 and 1 (avoiding exact 0 or 1)
+        ptm_presence = torch.clamp(ptm_presence, 1e-6, 1.0 - 1e-6)
+        
+        # For offset prediction
+        offset_hidden = self.offset_act(self.offset_hidden(x))
+        ptm_offset = self.offset_out(offset_hidden).squeeze(-1)
         
         return ptm_presence, ptm_offset
 
@@ -177,19 +184,15 @@ class PTMGlobalPredictor(nn.Module):
             nn.Softmax(dim=1)
         )
         
-        # Global prediction heads
-        self.ptm_presence = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
-            nn.ReLU(),
-            nn.Linear(d_model//2, 1),
-            nn.Sigmoid()
-        )
+        # For presence prediction
+        self.presence_hidden = nn.Linear(d_model, d_model//2)
+        self.presence_act = nn.ReLU()
+        self.presence_out = nn.Linear(d_model//2, 1)
         
-        self.ptm_offset = nn.Sequential(
-            nn.Linear(d_model, d_model//2),
-            nn.ReLU(),
-            nn.Linear(d_model//2, 1)
-        )
+        # For offset prediction
+        self.offset_hidden = nn.Linear(d_model, d_model//2)
+        self.offset_act = nn.ReLU()
+        self.offset_out = nn.Linear(d_model//2, 1)
     
     def forward(self, x, mask=None):
         """
@@ -198,8 +201,8 @@ class PTMGlobalPredictor(nn.Module):
             mask: Sequence mask [batch, seq_len]
             
         Returns:
-            ptm_presence: Global PTM presence [batch]
-            ptm_offset: Global PTM offset [batch]
+            ptm_presence: Global PTM presence [batch, 1]
+            ptm_offset: Global PTM offset [batch, 1]
         """
         # Compute attention weights
         attn_weights = self.attention(x)  # [batch, seq_len, 1]
@@ -213,9 +216,18 @@ class PTMGlobalPredictor(nn.Module):
         # Weighted pooling 
         global_repr = (x * attn_weights).sum(dim=1)  # [batch, d_model]
         
-        # Predict global PTM presence and offset
-        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)
-        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)
+        # For presence prediction - apply layers separately to control value range
+        presence_hidden = self.presence_act(self.presence_hidden(global_repr))
+        presence_logits = self.presence_out(presence_hidden)
+        
+        # Apply sigmoid and then strictly clamp values to prevent assertion errors
+        ptm_presence = torch.sigmoid(presence_logits)
+        # Clamp to ensure values are strictly between 0 and 1 (avoiding exact 0 or 1)
+        ptm_presence = torch.clamp(ptm_presence, 1e-6, 1.0 - 1e-6)
+        
+        # For offset prediction
+        offset_hidden = self.offset_act(self.offset_hidden(global_repr))
+        ptm_offset = self.offset_out(offset_hidden)
         
         return ptm_presence, ptm_offset
 
@@ -285,7 +297,7 @@ class Spec2PepWithPTM(nn.Module):
     
     def forward(self, features, teacher_forcing_ratio=1.0, temperature=1.0):
         """
-        Forward pass through the model with improved error handling.
+        Forward pass through the model with value safety checks.
         
         Args:
             features: Dictionary containing:
@@ -297,7 +309,7 @@ class Spec2PepWithPTM(nn.Module):
             temperature: Temperature parameter for softmax (lower = more peaked distribution)
         
         Returns:
-            Dictionary of model outputs with properly formatted tensors
+            Dictionary of model outputs with valid value ranges
         """
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -418,8 +430,11 @@ class Spec2PepWithPTM(nn.Module):
             # Replace decoder_output with our accumulated outputs
             decoder_output = decoder_outputs
         
-        # Generate local PTM predictions
+        # Generate local PTM predictions and apply strict value checking
         ptm_local_presence, ptm_local_offset = self.ptm_local_predictor(decoder_output)
+        
+        # CRITICAL FIX: Ensure local presence values are strictly between 0 and 1
+        ptm_local_presence = torch.clamp(ptm_local_presence, 1e-6, 1.0 - 1e-6)
         
         # Generate global PTM predictions
         attention_mask = features.get('attention_mask', None)
@@ -431,32 +446,8 @@ class Spec2PepWithPTM(nn.Module):
             mask=attention_mask
         )
         
-        # Ensure proper tensor dimensions and value ranges
-        # Sigmoid is already applied in PTMLocalPredictor, but double-check the range
-        ptm_local_presence = torch.clamp(ptm_local_presence, 0.0, 1.0)
-        
-        # Ensure global PTM presence is properly shaped (batch_size,) or (batch_size, 1)
-        if ptm_global_presence.dim() > 2:
-            ptm_global_presence = ptm_global_presence.squeeze()
-        if ptm_global_presence.dim() < 1:
-            ptm_global_presence = ptm_global_presence.unsqueeze(0)
-        if ptm_global_presence.dim() == 1:
-            ptm_global_presence = ptm_global_presence.unsqueeze(-1)
-        
-        # Clamp values to ensure they're in valid range
-        ptm_global_presence = torch.clamp(ptm_global_presence, 0.0, 1.0)
-        
-        # Ensure global PTM offset has matching shape with global presence
-        if ptm_global_offset.dim() > 2:
-            ptm_global_offset = ptm_global_offset.squeeze()
-        if ptm_global_offset.dim() < 1:
-            ptm_global_offset = ptm_global_offset.unsqueeze(0)
-        if ptm_global_offset.dim() == 1:
-            ptm_global_offset = ptm_global_offset.unsqueeze(-1)
-        
-        # Replace any NaN values that might have occurred
-        ptm_local_offset = torch.nan_to_num(ptm_local_offset)
-        ptm_global_offset = torch.nan_to_num(ptm_global_offset)
+        # CRITICAL FIX: Ensure global presence values are strictly between 0 and 1
+        ptm_global_presence = torch.clamp(ptm_global_presence, 1e-6, 1.0 - 1e-6)
         
         return {
             'sequence_probs': sequence_probs,
