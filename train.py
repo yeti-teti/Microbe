@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import math  # Added missing import
 from typing import Dict, Any, List, Tuple
 
 import torch
@@ -288,13 +289,9 @@ def train_one_epoch(
             # Update progress
             progress.update(train_task, advance=1)
             
-            # Log progress
+            # Log progress (only basic info during batches)
             if batch_idx % log_interval == 0:
                 progress.console.log(f"Batch {batch_idx}/{len(dataloader)}, Loss: {batch_loss_info['total']:.4f}")
-                
-                # Analyze predictions for one batch periodically
-                if batch_idx % (log_interval * 5) == 0:
-                    analyze_predictions(progress.console, model, features, targets, dataloader.dataset.id_to_aa)
     
     # Calculate averages
     batch_count = len(dataloader)
@@ -398,7 +395,7 @@ def decode_sequence(id_to_aa, sequence_ids):
     
     return ''.join(valid_aas)
 
-def analyze_predictions(console, model, features, targets, id_to_aa):
+def analyze_predictions(console, model, features, targets, id_to_aa, max_samples=5):
     """
     Analyze model predictions to check diversity.
     
@@ -408,6 +405,7 @@ def analyze_predictions(console, model, features, targets, id_to_aa):
         features: Batch features
         targets: Batch targets
         id_to_aa: ID to amino acid mapping
+        max_samples: Maximum number of samples to display (default: 5)
     """
     model.eval()
     
@@ -429,9 +427,10 @@ def analyze_predictions(console, model, features, targets, id_to_aa):
         pred_normal = outputs_normal['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
         
         # Count unique amino acids for the first few examples
-        n_examples = min(5, len(pred_cold))
+        n_examples = min(max_samples, len(pred_cold))
         
         aa_counts = {}
+        console.print("\n[bold]Sample Predictions:[/bold]")
         for i in range(n_examples):
             seq_cold = decode_sequence(id_to_aa, pred_cold[i])
             seq_normal = decode_sequence(id_to_aa, pred_normal[i])
@@ -446,6 +445,19 @@ def analyze_predictions(console, model, features, targets, id_to_aa):
             console.print(f"  True:    {true_seq}")
             console.print(f"  Cold:    {seq_cold}")
             console.print(f"  Normal:  {seq_normal}")
+            
+            # Add PTM information
+            true_ptm_pos = targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
+            if not isinstance(true_ptm_pos, list):
+                true_ptm_pos = [true_ptm_pos]
+            
+            pred_ptm_pos = (outputs_normal['ptm_local_presence'][i] > 0.5).nonzero().squeeze(-1).cpu().tolist()
+            if not isinstance(pred_ptm_pos, list):
+                pred_ptm_pos = [pred_ptm_pos]
+            
+            console.print(f"  True PTM positions:  {true_ptm_pos}")
+            console.print(f"  Pred PTM positions:  {pred_ptm_pos}")
+            console.print("")
     
     console.print(f"Amino acid distribution in predictions: {sorted(aa_counts.items())}")
 
@@ -693,6 +705,11 @@ def train_model(args):
         
         # Log metrics
         console.log(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        console.log("Loss Components:")
+        for k, v in train_loss_info.items():
+            if k == 'total':
+                continue
+            console.log(f"  Train {k}: {v:.4f}, Val {k}: {val_loss_info[k]:.4f}")
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
@@ -708,6 +725,11 @@ def train_model(args):
             if k == 'total':
                 continue
             writer.add_scalar(f'LossComponents/val_{k}', v, epoch)
+        
+        # Analyze predictions only after each epoch
+        # Get a small batch for analysis
+        eval_features, eval_targets = next(iter(val_loader))
+        analyze_predictions(console, model, eval_features, eval_targets, id_to_aa, max_samples=5)
         
         # Save checkpoint
         if (epoch + 1) % args.save_interval == 0:
@@ -743,7 +765,7 @@ def train_model(args):
         # Show some predictions
         if (epoch + 1) % args.save_interval == 0:
             with torch.no_grad():
-                table = predict_and_visualize(model, val_loader, id_to_aa, device)
+                table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5)
                 console.print(table)
     
     console.log("[green]Training complete![/green]")
@@ -759,7 +781,7 @@ def train_model(args):
     
     # Visualize final predictions
     with torch.no_grad():
-        table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=10)
+        table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5)
         console.print(table)
     
     # Save final model
