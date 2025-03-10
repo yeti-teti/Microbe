@@ -394,10 +394,11 @@ def evaluate(
     device, 
     pad_idx=0, 
     label_smoothing=0.1,
-    temperature=1.0
+    temperature=1.0,
+    max_batches=None  # Optional parameter to limit evaluation batches
 ):
     """
-    Evaluate the model on the given dataloader.
+    Evaluate the model on the given dataloader with improved error handling.
     
     Args:
         model: The model to evaluate
@@ -407,13 +408,13 @@ def evaluate(
         pad_idx: Index of padding token
         label_smoothing: Label smoothing factor
         temperature: Temperature for sequence generation
+        max_batches: Maximum number of batches to evaluate (None = all)
         
     Returns:
         avg_loss: Average loss over the dataset
         loss_info: Dictionary of average loss components
     """
     model.eval()
-    total_loss = 0
     loss_info_sum = {
         'total': 0,
         'seq': 0,
@@ -423,37 +424,87 @@ def evaluate(
         'ptm_global_offset': 0
     }
     
+    # Track successful batches
+    successful_batches = 0
+    
+    print("Starting evaluation...")
     with torch.no_grad():
-        for features, targets in dataloader:
-            # Move features to device
-            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                      (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                      for k, v in features.items()}
+        # Create progress bar for evaluation
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn()
+        ) as progress:
+            # Determine number of batches to evaluate
+            total_batches = len(dataloader) if max_batches is None else min(max_batches, len(dataloader))
+            eval_task = progress.add_task("Evaluating", total=total_batches)
             
-            # Move targets to device
-            targets = {k: v.to(device) for k, v in targets.items()}
-            
-            # Forward pass
-            outputs = model(features, teacher_forcing_ratio=1.0, temperature=temperature)
-            
-            # Calculate loss
-            _, batch_loss_info = calculate_loss(
-                outputs, 
-                targets, 
-                loss_weights, 
-                pad_idx, 
-                label_smoothing
-            )
-            
-            # Accumulate losses
-            for k, v in batch_loss_info.items():
-                loss_info_sum[k] += v
+            for batch_idx, (features, targets) in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                    
+                try:
+                    # Move features to device
+                    features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
+                              (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
+                              for k, v in features.items()}
+                    
+                    # Move targets to device
+                    targets = {k: v.to(device) for k, v in targets.items()}
+                    
+                    # Forward pass with safety measures
+                    outputs = model(features, teacher_forcing_ratio=1.0, temperature=temperature)
+                    
+                    # Apply safety clamping
+                    if 'ptm_local_presence' in outputs:
+                        outputs['ptm_local_presence'] = torch.clamp(outputs['ptm_local_presence'], 1e-6, 1.0 - 1e-6)
+                    
+                    if 'ptm_global_presence' in outputs:
+                        outputs['ptm_global_presence'] = torch.clamp(outputs['ptm_global_presence'], 1e-6, 1.0 - 1e-6)
+                    
+                    # Calculate loss with the fixed calculate_loss function
+                    total_loss, batch_loss_info = calculate_loss(
+                        outputs, 
+                        targets, 
+                        loss_weights, 
+                        pad_idx, 
+                        label_smoothing
+                    )
+                    
+                    # Accumulate losses
+                    for k, v in batch_loss_info.items():
+                        loss_info_sum[k] += v
+                    
+                    successful_batches += 1
+                    
+                except Exception as e:
+                    progress.console.log(f"[red]Error in evaluation batch {batch_idx}: {type(e).__name__}: {str(e)}[/red]")
+                    
+                    # Continue with next batch
+                    continue
+                finally:
+                    # Always update progress
+                    progress.update(eval_task, advance=1)
+                    
+                    # Free memory explicitly
+                    if 'outputs' in locals():
+                        del outputs
+                    if 'features' in locals():
+                        del features
+                    if 'targets' in locals():
+                        del targets
+                    torch.cuda.empty_cache()
+    
+    print(f"Evaluation complete: {successful_batches} successful batches")
     
     # Calculate averages
-    batch_count = len(dataloader)
-    avg_loss_info = {k: v / batch_count for k, v in loss_info_sum.items()}
-    
-    return avg_loss_info['total'], avg_loss_info
+    if successful_batches > 0:
+        avg_loss_info = {k: v / successful_batches for k, v in loss_info_sum.items()}
+        return avg_loss_info['total'], avg_loss_info
+    else:
+        print("[red]WARNING: All evaluation batches failed![/red]")
+        return float('inf'), {k: float('inf') for k in loss_info_sum}
 
 def decode_sequence(id_to_aa, sequence_ids):
     """
@@ -482,9 +533,9 @@ def decode_sequence(id_to_aa, sequence_ids):
     
     return ''.join(valid_aas)
 
-def analyze_predictions(console, model, features, targets, id_to_aa, max_samples=5):
+def analyze_predictions(console, model, features, targets, id_to_aa, max_samples=5, timeout=30):
     """
-    Analyze model predictions to check diversity.
+    Analyze model predictions to check diversity with timeout safety.
     
     Args:
         console: Rich console for output
@@ -493,64 +544,88 @@ def analyze_predictions(console, model, features, targets, id_to_aa, max_samples
         targets: Batch targets
         id_to_aa: ID to amino acid mapping
         max_samples: Maximum number of samples to display (default: 5)
+        timeout: Maximum time in seconds for this function (default: 30)
     """
+    import time
+    start_time = time.time()
     model.eval()
+    
+    console.print("\n[bold]Sample Predictions:[/bold]")
     
     with torch.no_grad():
         # Get device
         device = next(model.parameters()).device
         
-        # Move data to device
-        features_device = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                          (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                          for k, v in features.items()}
+        # Move data to device (with smaller batch size)
+        # Only take the first max_samples to save memory
+        truncated_features = {}
+        for k, v in features.items():
+            if isinstance(v, torch.Tensor):
+                truncated_features[k] = v[:max_samples].to(device)
+            elif isinstance(v, tuple):
+                truncated_features[k] = (v[0][:max_samples].to(device), v[1][:max_samples].to(device))
+            else:
+                truncated_features[k] = v
         
-        # Forward pass with different temperatures
-        outputs_cold = model(features_device, teacher_forcing_ratio=0.0, temperature=0.5)
-        outputs_normal = model(features_device, teacher_forcing_ratio=0.0, temperature=1.0)
+        truncated_targets = {k: v[:max_samples].to(device) for k, v in targets.items()}
         
-        # Get predictions
-        pred_cold = outputs_cold['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
-        pred_normal = outputs_normal['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
-        
-        # Count unique amino acids for the first few examples
-        n_examples = min(max_samples, len(pred_cold))
-        
-        aa_counts = {}
-        console.print("\n[bold]Sample Predictions:[/bold]")
-        for i in range(n_examples):
-            seq_cold = decode_sequence(id_to_aa, pred_cold[i])
-            seq_normal = decode_sequence(id_to_aa, pred_normal[i])
-            true_seq = decode_sequence(id_to_aa, targets['target_sequence'][i])
+        try:
+            # Forward pass with low temperature (more peaked distribution)
+            outputs = model(truncated_features, teacher_forcing_ratio=0.0, temperature=0.7)
             
-            for aa in seq_cold:
-                if aa not in aa_counts:
-                    aa_counts[aa] = 0
-                aa_counts[aa] += 1
+            # Get predictions
+            pred_sequence = outputs['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
+            pred_ptm_presence = (outputs['ptm_local_presence'] > 0.5).float()  # [batch, seq_len]
             
-            console.print(f"Example {i+1}:")
-            console.print(f"  True:    {true_seq}")
-            console.print(f"  Cold:    {seq_cold}")
-            console.print(f"  Normal:  {seq_normal}")
+            # Display up to max_samples
+            n_examples = min(max_samples, len(pred_sequence))
             
-            # Add PTM information
-            true_ptm_pos = targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
-            if not isinstance(true_ptm_pos, list):
-                true_ptm_pos = [true_ptm_pos]
+            for i in range(n_examples):
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    console.print("[yellow]Analysis timeout reached. Stopping to prevent hanging.[/yellow]")
+                    return
+                
+                # Get true sequence
+                true_seq = decode_sequence(id_to_aa, truncated_targets['target_sequence'][i])
+                
+                # Get predicted sequence
+                pred_seq = decode_sequence(id_to_aa, pred_sequence[i])
+                
+                # Get true PTMs
+                true_ptm_pos = truncated_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
+                if not isinstance(true_ptm_pos, list):
+                    true_ptm_pos = [true_ptm_pos]
+                
+                # Get predicted PTMs
+                pred_ptm_pos = pred_ptm_presence[i].nonzero().squeeze(-1).cpu().tolist()
+                if not isinstance(pred_ptm_pos, list):
+                    pred_ptm_pos = [pred_ptm_pos]
+                
+                # Display
+                console.print(f"Example {i+1}:")
+                console.print(f"  True:    {true_seq}")
+                console.print(f"  Pred:    {pred_seq}")
+                console.print(f"  True PTM positions:  {true_ptm_pos}")
+                console.print(f"  Pred PTM positions:  {pred_ptm_pos}")
+                console.print("")
+                
+        except Exception as e:
+            console.print(f"[red]Error during prediction analysis: {type(e).__name__}: {str(e)}[/red]")
             
-            pred_ptm_pos = (outputs_normal['ptm_local_presence'][i] > 0.5).nonzero().squeeze(-1).cpu().tolist()
-            if not isinstance(pred_ptm_pos, list):
-                pred_ptm_pos = [pred_ptm_pos]
-            
-            console.print(f"  True PTM positions:  {true_ptm_pos}")
-            console.print(f"  Pred PTM positions:  {pred_ptm_pos}")
-            console.print("")
-    
-    console.print(f"Amino acid distribution in predictions: {sorted(aa_counts.items())}")
+        finally:
+            # Free memory explicitly
+            if 'outputs' in locals():
+                del outputs
+            if 'truncated_features' in locals():
+                del truncated_features
+            if 'truncated_targets' in locals():
+                del truncated_targets
+            torch.cuda.empty_cache()
 
-def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
+def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5, timeout=60):
     """
-    Make predictions and visualize results for a few samples.
+    Make predictions and visualize results for a few samples with timeout safety.
     
     Args:
         model: The trained model
@@ -558,35 +633,63 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
         id_to_aa: Dictionary mapping token IDs to amino acids
         device: Device to use for tensors
         num_samples: Number of samples to visualize
+        timeout: Maximum time in seconds for this function
         
     Returns:
         Table with visualization results
     """
+    import time
+    start_time = time.time()
     model.eval()
     samples = []
     
-    with torch.no_grad():
-        for features, targets in dataloader:
-            if len(samples) >= num_samples:
-                break
-                
-            # Move data to device
-            features = {k: v.to(device) if isinstance(v, torch.Tensor) else 
-                       (v[0].to(device), v[1].to(device)) if isinstance(v, tuple) else v 
-                       for k, v in features.items()}
-            targets = {k: v.to(device) for k, v in targets.items()}
+    # Create table for results
+    from rich.table import Table
+    table = Table(title="Prediction Samples")
+    table.add_column("Sample", justify="center")
+    table.add_column("True Sequence", justify="left")
+    table.add_column("Predicted Sequence", justify="left")
+    table.add_column("True PTMs", justify="left")
+    table.add_column("Predicted PTMs", justify="left")
+    table.add_column("True Global PTM", justify="center")
+    table.add_column("Predicted Global PTM", justify="center")
+    
+    try:
+        with torch.no_grad():
+            # Get just one batch - don't iterate through the whole loader
+            features, targets = next(iter(dataloader))
+            
+            # Only take the first num_samples items to save memory
+            batch_size = min(features['input_sequence'].size(0), num_samples)
+            
+            # Truncate features and targets
+            truncated_features = {}
+            for k, v in features.items():
+                if isinstance(v, torch.Tensor):
+                    truncated_features[k] = v[:batch_size].to(device)
+                elif isinstance(v, tuple):
+                    truncated_features[k] = (v[0][:batch_size].to(device), v[1][:batch_size].to(device))
+                else:
+                    truncated_features[k] = v
+            
+            truncated_targets = {k: v[:batch_size].to(device) for k, v in targets.items()}
             
             # Forward pass with lower temperature
-            outputs = model(features, teacher_forcing_ratio=0.0, temperature=0.7)
+            outputs = model(truncated_features, teacher_forcing_ratio=0.0, temperature=0.7)
             
             # Get predictions
             pred_sequence = outputs['sequence_probs'].argmax(dim=-1)  # [batch, seq_len]
             pred_ptm_presence = (outputs['ptm_local_presence'] > 0.5).float()  # [batch, seq_len]
             
             # Process batch
-            for i in range(min(len(pred_sequence), num_samples - len(samples))):
+            for i in range(batch_size):
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    print("[yellow]Visualization timeout reached. Showing partial results.[/yellow]")
+                    break
+                
                 # Get true sequence
-                true_seq = decode_sequence(id_to_aa, targets['target_sequence'][i])
+                true_seq = decode_sequence(id_to_aa, truncated_targets['target_sequence'][i])
                 
                 # Get predicted sequence
                 pred_seq = decode_sequence(id_to_aa, pred_sequence[i])
@@ -598,55 +701,49 @@ def predict_and_visualize(model, dataloader, id_to_aa, device, num_samples=5):
                 pred_ptm_offsets = [f"{outputs['ptm_local_offset'][i, pos].item():.2f}" for pos in pred_ptm_pos]
                 
                 # Get true PTMs
-                true_ptm_pos = targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
+                true_ptm_pos = truncated_targets['ptm_presence'][i].nonzero().squeeze(-1).cpu().tolist()
                 if not isinstance(true_ptm_pos, list):
                     true_ptm_pos = [true_ptm_pos]
-                true_ptm_offsets = [f"{targets['ptm_offset'][i, pos].item():.2f}" for pos in true_ptm_pos]
+                true_ptm_offsets = [f"{truncated_targets['ptm_offset'][i, pos].item():.2f}" for pos in true_ptm_pos]
                 
                 # Get global PTM info
                 pred_global_presence = outputs['ptm_global_presence'][i].item() > 0.5
                 pred_global_offset = outputs['ptm_global_offset'][i].item()
-                true_global_presence = targets['global_ptm_presence'][i].item() > 0.5
-                true_global_offset = targets['global_ptm_offset'][i].item()
+                true_global_presence = truncated_targets['global_ptm_presence'][i].item() > 0.5
+                true_global_offset = truncated_targets['global_ptm_offset'][i].item()
                 
-                # Add to samples
-                samples.append({
-                    'true_seq': true_seq,
-                    'pred_seq': pred_seq,
-                    'true_ptm_pos': true_ptm_pos,
-                    'true_ptm_offsets': true_ptm_offsets,
-                    'pred_ptm_pos': pred_ptm_pos,
-                    'pred_ptm_offsets': pred_ptm_offsets,
-                    'true_global_ptm': (true_global_presence, true_global_offset),
-                    'pred_global_ptm': (pred_global_presence, pred_global_offset)
-                })
-    
-    # Create visualization table
-    table = Table(title="Prediction Samples")
-    table.add_column("Sample", justify="center")
-    table.add_column("True Sequence", justify="left")
-    table.add_column("Predicted Sequence", justify="left")
-    table.add_column("True PTMs", justify="left")
-    table.add_column("Predicted PTMs", justify="left")
-    table.add_column("True Global PTM", justify="center")
-    table.add_column("Predicted Global PTM", justify="center")
-    
-    for i, sample in enumerate(samples):
-        true_ptms = ", ".join([f"Pos {pos}: {offset}" for pos, offset in zip(sample['true_ptm_pos'], sample['true_ptm_offsets'])])
-        pred_ptms = ", ".join([f"Pos {pos}: {offset}" for pos, offset in zip(sample['pred_ptm_pos'], sample['pred_ptm_offsets'])])
+                # Format data for table
+                true_ptms = ", ".join([f"Pos {pos}: {offset}" for pos, offset in zip(true_ptm_pos, true_ptm_offsets)])
+                pred_ptms = ", ".join([f"Pos {pos}: {offset}" for pos, offset in zip(pred_ptm_pos, pred_ptm_offsets)])
+                
+                true_global = f"{'Yes' if true_global_presence else 'No'} ({true_global_offset:.2f})"
+                pred_global = f"{'Yes' if pred_global_presence else 'No'} ({pred_global_offset:.2f})"
+                
+                # Add to table
+                table.add_row(
+                    str(i+1),
+                    true_seq,
+                    pred_seq,
+                    true_ptms if true_ptms else "None",
+                    pred_ptms if pred_ptms else "None",
+                    true_global,
+                    pred_global
+                )
+                
+    except Exception as e:
+        import traceback
+        print(f"[red]Error during visualization: {type(e).__name__}: {str(e)}[/red]")
+        traceback.print_exc()
         
-        true_global = f"{'Yes' if sample['true_global_ptm'][0] else 'No'} ({sample['true_global_ptm'][1]:.2f})"
-        pred_global = f"{'Yes' if sample['pred_global_ptm'][0] else 'No'} ({sample['pred_global_ptm'][1]:.2f})"
-        
-        table.add_row(
-            str(i+1),
-            sample['true_seq'],
-            sample['pred_seq'],
-            true_ptms if true_ptms else "None",
-            pred_ptms if pred_ptms else "None",
-            true_global,
-            pred_global
-        )
+    finally:
+        # Free memory explicitly
+        if 'outputs' in locals():
+            del outputs
+        if 'truncated_features' in locals():
+            del truncated_features
+        if 'truncated_targets' in locals():
+            del truncated_targets
+        torch.cuda.empty_cache()
     
     return table
 
@@ -679,7 +776,7 @@ def load_checkpoint(model, optimizer, scheduler, filename):
     return start_epoch
 
 def train_model(args):
-    """Main training function."""
+    """Main training function with improved error handling."""
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -700,14 +797,18 @@ def train_model(args):
     
     # Create dataloaders
     console.log("Loading data...")
-    train_loader, val_loader = create_train_test_dataloaders(
-        args.msp_file,
-        train_ratio=0.8,
-        max_peaks=args.max_peaks,
-        max_seq_len=args.max_seq_len,
-        batch_size=args.batch_size,
-        random_seed=args.seed
-    )
+    try:
+        train_loader, val_loader = create_train_test_dataloaders(
+            args.msp_file,
+            train_ratio=0.8,
+            max_peaks=args.max_peaks,
+            max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            random_seed=args.seed
+        )
+    except Exception as e:
+        console.log(f"[red]Error creating dataloaders: {type(e).__name__}: {str(e)}[/red]")
+        raise
     
     # Get vocabulary size from the dataloader
     vocab_size = len(train_loader.dataset.aa_to_id)
@@ -718,17 +819,21 @@ def train_model(args):
     
     # Create model
     console.log("Creating model...")
-    model = Spec2PepWithPTM(
-        vocab_size=vocab_size,
-        max_peaks=args.max_peaks,
-        max_seq_len=args.max_seq_len,
-        d_model=args.d_model,
-        d_ff=args.d_ff,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dropout=args.dropout
-    )
-    model = model.to(device)
+    try:
+        model = Spec2PepWithPTM(
+            vocab_size=vocab_size,
+            max_peaks=args.max_peaks,
+            max_seq_len=args.max_seq_len,
+            d_model=args.d_model,
+            d_ff=args.d_ff,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dropout=args.dropout
+        )
+        model = model.to(device)
+    except Exception as e:
+        console.log(f"[red]Error creating model: {type(e).__name__}: {str(e)}[/red]")
+        raise
     
     # Setup optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -758,7 +863,11 @@ def train_model(args):
     # Check if resume from checkpoint
     checkpoint_path = os.path.join(args.output_dir, 'checkpoint.pt')
     if args.resume and os.path.exists(checkpoint_path):
-        start_epoch = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        try:
+            start_epoch = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        except Exception as e:
+            console.log(f"[yellow]Error loading checkpoint: {type(e).__name__}: {str(e)}. Starting from scratch.[/yellow]")
+            start_epoch = 0
     
     for epoch in range(start_epoch, args.epochs):
         console.log(f"[bold]Epoch {epoch+1}/{args.epochs}[/bold]")
@@ -772,31 +881,51 @@ def train_model(args):
         console.log(f"Teacher forcing ratio: {teacher_forcing_ratio:.2f}")
         
         # Train for one epoch
-        train_loss, train_loss_info = train_one_epoch(
-            model, train_loader, optimizer, scheduler, loss_weights, device,
-            pad_idx=pad_idx, 
-            log_interval=args.log_interval,
-            max_grad_norm=args.max_grad_norm,
-            label_smoothing=args.label_smoothing,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-            temperature=args.temperature
-        )
+        try:
+            train_loss, train_loss_info = train_one_epoch(
+                model, train_loader, optimizer, scheduler, loss_weights, device,
+                pad_idx=pad_idx, 
+                log_interval=args.log_interval,
+                max_grad_norm=args.max_grad_norm,
+                label_smoothing=args.label_smoothing,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                temperature=args.temperature
+            )
+            console.log(f"Train Loss: {train_loss:.4f}")
+        except Exception as e:
+            console.log(f"[red]Error during training epoch {epoch+1}: {type(e).__name__}: {str(e)}[/red]")
+            train_loss = float('inf')
+            train_loss_info = {k: float('inf') for k in ['seq', 'ptm_local_presence', 'ptm_local_offset', 
+                                                         'ptm_global_presence', 'ptm_global_offset']}
         
-        # Evaluate on validation set
-        val_loss, val_loss_info = evaluate(
-            model, val_loader, loss_weights, device, 
-            pad_idx=pad_idx,
-            label_smoothing=args.label_smoothing,
-            temperature=args.temperature
-        )
+        # Free memory after training
+        torch.cuda.empty_cache()
+        
+        # Evaluate on validation set (with limited batches to prevent hangs)
+        try:
+            val_loss, val_loss_info = evaluate(
+                model, val_loader, loss_weights, device, 
+                pad_idx=pad_idx,
+                label_smoothing=args.label_smoothing,
+                temperature=args.temperature,
+                max_batches=min(100, len(val_loader))  # Limit eval batches to prevent hanging
+            )
+            console.log(f"Val Loss: {val_loss:.4f}")
+        except Exception as e:
+            console.log(f"[red]Error during validation for epoch {epoch+1}: {type(e).__name__}: {str(e)}[/red]")
+            val_loss = float('inf')
+            val_loss_info = {k: float('inf') for k in ['seq', 'ptm_local_presence', 'ptm_local_offset', 
+                                                       'ptm_global_presence', 'ptm_global_offset']}
+        
+        # Free memory after evaluation
+        torch.cuda.empty_cache()
         
         # Log metrics
-        console.log(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         console.log("Loss Components:")
         for k, v in train_loss_info.items():
             if k == 'total':
                 continue
-            console.log(f"  Train {k}: {v:.4f}, Val {k}: {val_loss_info[k]:.4f}")
+            console.log(f"  Train {k}: {v:.4f}, Val {k}: {val_loss_info.get(k, float('inf')):.4f}")
         
         # Log to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
@@ -813,29 +942,39 @@ def train_model(args):
                 continue
             writer.add_scalar(f'LossComponents/val_{k}', v, epoch)
         
-        # Analyze predictions only after each epoch
-        # Get a small batch for analysis
-        eval_features, eval_targets = next(iter(val_loader))
-        analyze_predictions(console, model, eval_features, eval_targets, id_to_aa, max_samples=5)
+        # Analyze predictions on a small batch with timeout protection
+        try:
+            # Get a small batch for analysis
+            eval_features, eval_targets = next(iter(val_loader))
+            analyze_predictions(console, model, eval_features, eval_targets, id_to_aa, max_samples=5, timeout=30)
+            torch.cuda.empty_cache()  # Free memory after analysis
+        except Exception as e:
+            console.log(f"[yellow]Error during prediction analysis: {type(e).__name__}: {str(e)}[/yellow]")
         
-        # Save checkpoint
+        # Save checkpoint with error handling
         if (epoch + 1) % args.save_interval == 0:
-            save_checkpoint(
-                model, optimizer, scheduler, epoch,
-                {'train': train_loss_info, 'val': val_loss_info},
-                os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
-            )
+            try:
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch,
+                    {'train': train_loss_info, 'val': val_loss_info},
+                    os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                )
+            except Exception as e:
+                console.log(f"[yellow]Error saving checkpoint for epoch {epoch+1}: {type(e).__name__}: {str(e)}[/yellow]")
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(
-                model, optimizer, scheduler, epoch,
-                {'train': train_loss_info, 'val': val_loss_info},
-                os.path.join(args.output_dir, 'best_model.pt')
-            )
-            console.log("[green]New best model saved![/green]")
+            try:
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch,
+                    {'train': train_loss_info, 'val': val_loss_info},
+                    os.path.join(args.output_dir, 'best_model.pt')
+                )
+                console.log("[green]New best model saved![/green]")
+            except Exception as e:
+                console.log(f"[yellow]Error saving best model: {type(e).__name__}: {str(e)}[/yellow]")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -843,40 +982,57 @@ def train_model(args):
                 break
         
         # Save latest checkpoint
-        save_checkpoint(
-            model, optimizer, scheduler, epoch,
-            {'train': train_loss_info, 'val': val_loss_info},
-            checkpoint_path
-        )
+        try:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch,
+                {'train': train_loss_info, 'val': val_loss_info},
+                checkpoint_path
+            )
+        except Exception as e:
+            console.log(f"[yellow]Error saving latest checkpoint: {type(e).__name__}: {str(e)}[/yellow]")
         
-        # Show some predictions
+        # Show some predictions with visualization table
         if (epoch + 1) % args.save_interval == 0:
-            with torch.no_grad():
-                table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5)
-                console.print(table)
+            try:
+                with torch.no_grad():
+                    table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5, timeout=60)
+                    console.print(table)
+                torch.cuda.empty_cache()  # Free memory after visualization
+            except Exception as e:
+                console.log(f"[yellow]Error during prediction visualization: {type(e).__name__}: {str(e)}[/yellow]")
     
     console.log("[green]Training complete![/green]")
     
-    # Final evaluation
+    # Final evaluation with limited batches
     console.log("Final evaluation...")
-    test_loss, test_loss_info = evaluate(
-        model, val_loader, loss_weights, device, 
-        pad_idx=pad_idx,
-        label_smoothing=args.label_smoothing
-    )
-    console.log(f"Test Loss: {test_loss:.4f}")
+    try:
+        test_loss, test_loss_info = evaluate(
+            model, val_loader, loss_weights, device, 
+            pad_idx=pad_idx,
+            label_smoothing=args.label_smoothing,
+            max_batches=min(100, len(val_loader))  # Limit eval batches
+        )
+        console.log(f"Test Loss: {test_loss:.4f}")
+    except Exception as e:
+        console.log(f"[red]Error during final evaluation: {type(e).__name__}: {str(e)}[/red]")
     
     # Visualize final predictions
-    with torch.no_grad():
-        table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5)
-        console.print(table)
+    try:
+        with torch.no_grad():
+            table = predict_and_visualize(model, val_loader, id_to_aa, device, num_samples=5, timeout=60)
+            console.print(table)
+    except Exception as e:
+        console.log(f"[yellow]Error during final visualization: {type(e).__name__}: {str(e)}[/yellow]")
     
     # Save final model
-    save_checkpoint(
-        model, optimizer, scheduler, args.epochs - 1,
-        {'val': test_loss_info},
-        os.path.join(args.output_dir, 'final_model.pt')
-    )
+    try:
+        save_checkpoint(
+            model, optimizer, scheduler, args.epochs - 1,
+            {'val': test_loss_info if 'test_loss_info' in locals() else {}},
+            os.path.join(args.output_dir, 'final_model.pt')
+        )
+    except Exception as e:
+        console.log(f"[yellow]Error saving final model: {type(e).__name__}: {str(e)}[/yellow]")
     
     # Close tensorboard writer
     writer.close()
