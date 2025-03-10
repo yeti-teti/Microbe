@@ -268,13 +268,16 @@ class Spec2PepWithPTM(nn.Module):
         Returns:
             Dictionary of model outputs
         """
-        # Extract inputs
+        # Get device from model parameters
+        device = next(self.parameters()).device
+        
+        # Extract inputs and move to the correct device
         peaks = features['peaks']
-        precursor = features['precursor']
-        seq_tokens = features['input_sequence']
+        peaks_mz, peaks_intensity = peaks[0].to(device), peaks[1].to(device)
+        precursor = features['precursor'].to(device)
+        seq_tokens = features['input_sequence'].to(device)
         
         # Process peaks
-        peaks_mz, peaks_intensity = peaks
         peak_encoding = self.peak_encoder(peaks_mz, peaks_intensity)  # [batch, max_peaks, d_model]
         
         # Process precursor
@@ -286,7 +289,7 @@ class Spec2PepWithPTM(nn.Module):
         # Create memory padding mask (True = padding position to be masked)
         memory_key_padding_mask = torch.zeros(
             (memory.size(0), memory.size(1)), 
-            device=memory.device,
+            device=device,
             dtype=torch.bool
         )
         # Set the peaks part of the mask using the mz values
@@ -298,13 +301,13 @@ class Spec2PepWithPTM(nn.Module):
         
         # Create sequence padding mask (True = padding position to be masked)
         if 'attention_mask' in features:
-            seq_padding_mask = ~features['attention_mask']  # Convert from "attend" to "mask"
+            seq_padding_mask = ~features['attention_mask'].to(device)  # Convert from "attend" to "mask"
         else:
             seq_padding_mask = None
         
         # Create causal mask for autoregressive decoding
         seq_len = seq_tokens.size(1)
-        tgt_mask = generate_square_subsequent_mask(seq_len, seq_tokens.device)
+        tgt_mask = generate_square_subsequent_mask(seq_len, device)
         
         # Apply transformer decoder
         decoder_output = self.transformer_decoder(
@@ -320,7 +323,7 @@ class Spec2PepWithPTM(nn.Module):
         ptm_local_presence, ptm_local_offset = self.ptm_local_predictor(decoder_output)
         ptm_global_presence, ptm_global_offset = self.ptm_global_predictor(
             decoder_output, 
-            mask=features.get('attention_mask', None)
+            mask=features.get('attention_mask', None).to(device) if features.get('attention_mask', None) is not None else None
         )
         
         return {
