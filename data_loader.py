@@ -355,16 +355,19 @@ class PTMSpectrumDataloader(Dataset):
         # Prepare sequence tensors
         input_tensor, target_tensor = self.prepare_sequence_tensors(tokens, self.max_seq_len)
         
-        # Prepare PTM-specific targets
+        # Local PTM presence/offset: shape [seq_len]
         ptm_presence, ptm_offset = self.prepare_ptm_targets(
             self.base_sequences[idx], 
             self.ptm_info[idx], 
             self.max_seq_len
         )
         
-        # Global PTM information (sum of all modifications)
-        global_offset = self.global_offsets[idx]
-        global_ptm_presence = torch.tensor([1.0 if global_offset > 0 else 0.0], dtype=torch.float32)
+        # Global PTM: shape [1] each
+        global_offset = self.global_offsets[idx]  # float
+        global_ptm_presence = torch.tensor(
+            [1.0 if global_offset != 0.0 else 0.0],
+            dtype=torch.float32
+        )
         global_ptm_offset = torch.tensor([global_offset], dtype=torch.float32)
         
         # Prepare MS2 spectrum peaks
@@ -392,10 +395,10 @@ class PTMSpectrumDataloader(Dataset):
             'sequence_length': token_len,
         }, {
             'target_sequence': target_tensor,
-            'ptm_presence': ptm_presence,
-            'ptm_offset': ptm_offset,
-            'global_ptm_presence': global_ptm_presence, 
-            'global_ptm_offset': global_ptm_offset
+            'ptm_presence': ptm_presence,      # shape [seq_len]
+            'ptm_offset': ptm_offset,          # shape [seq_len]
+            'global_ptm_presence': global_ptm_presence,  # shape [1]
+            'global_ptm_offset': global_ptm_offset       # shape [1]
         }
     
 def create_train_test_dataloaders(msp_filename, train_ratio=0.8, max_peaks=200, max_seq_len=50, 

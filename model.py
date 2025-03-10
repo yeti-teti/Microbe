@@ -137,14 +137,14 @@ class SequenceGenerator(nn.Module):
         return F.log_softmax(logits / temperature, dim=-1)
 
 class PTMLocalPredictor(nn.Module):
-    """Predicts local PTM presence (logits) and mass offset"""
+    """Predicts local PTM presence (logits) and mass offset."""
     def __init__(self, d_model):
         super(PTMLocalPredictor, self).__init__()
-        # Remove Sigmoid here — we output raw logits for presence
+        # We output raw logits for presence, so no Sigmoid here:
         self.ptm_presence = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)
+            nn.Linear(d_model // 2, 1)  # raw logits
         )
         
         self.ptm_offset = nn.Sequential(
@@ -155,33 +155,31 @@ class PTMLocalPredictor(nn.Module):
     
     def forward(self, x):
         """
-        Args:
-            x: Transformer decoder output [batch, seq_len, d_model]
-
+        x: [batch, seq_len, d_model]
         Returns:
-            ptm_presence: Logits for PTM presence [batch, seq_len]
-            ptm_offset: Predicted mass shift at each position [batch, seq_len]
+            ptm_presence: shape [batch, seq_len] (logits)
+            ptm_offset:   shape [batch, seq_len]
         """
-        ptm_presence = self.ptm_presence(x).squeeze(-1)  # shape: [batch, seq_len]
-        ptm_offset = self.ptm_offset(x).squeeze(-1)      # shape: [batch, seq_len]
-        
+        ptm_presence = self.ptm_presence(x).squeeze(-1)  # [batch, seq_len]
+        ptm_offset = self.ptm_offset(x).squeeze(-1)      # [batch, seq_len]
         return ptm_presence, ptm_offset
 
 
 class PTMGlobalPredictor(nn.Module):
-    """Predicts global PTM presence (logits) and total mass offset"""
+    """Predicts global PTM presence (logits) and total mass offset."""
     def __init__(self, d_model):
         super(PTMGlobalPredictor, self).__init__()
-        # Attention pooling for the sequence
+        # Weighted attention pooling across sequence:
         self.attention = nn.Sequential(
             nn.Linear(d_model, 1),
             nn.Softmax(dim=1)
         )
         
+        # Output raw logits for presence:
         self.ptm_presence = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model // 2, 1)
+            nn.Linear(d_model // 2, 1)  # raw logits
         )
         
         self.ptm_offset = nn.Sequential(
@@ -192,32 +190,31 @@ class PTMGlobalPredictor(nn.Module):
     
     def forward(self, x, mask=None):
         """
-        Args:
-            x: Decoder output [batch, seq_len, d_model]
-            mask: Sequence mask [batch, seq_len]
-            
+        x: [batch, seq_len, d_model]
+        mask: [batch, seq_len], 1/True=keep, 0/False=ignore
         Returns:
-            ptm_presence: Logits for global PTM presence [batch]
-            ptm_offset: Global PTM offset [batch]
+            ptm_presence: shape [batch] (logits)
+            ptm_offset:   shape [batch]
         """
-        # Compute attention weights
+        # Compute attention weights over seq_len
         attn_weights = self.attention(x)  # [batch, seq_len, 1]
         
         if mask is not None:
-            # Apply mask to attention weights
-            mask = mask.float().unsqueeze(-1)
+            # Apply mask to zero out weights
+            mask = mask.float().unsqueeze(-1)  # [batch, seq_len, 1]
             attn_weights = attn_weights * mask
+            # Renormalize so they sum to 1
             attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-9)
         
-        # Weighted pooling to get a single vector
+        # Weighted average across seq_len
         global_repr = (x * attn_weights).sum(dim=1)  # [batch, d_model]
         
-        # Predict global PTM presence (logits) and offset
-        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)  # shape: [batch]
-        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)      # shape: [batch]
+        # Predict presence (logits) + offset
+        ptm_presence = self.ptm_presence(global_repr).squeeze(-1)  # [batch]
+        ptm_offset = self.ptm_offset(global_repr).squeeze(-1)      # [batch]
         
         return ptm_presence, ptm_offset
-
+    
 
 class Spec2PepWithPTM(nn.Module):
     """

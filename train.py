@@ -77,56 +77,81 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.1):
     """
-    Calculate the combined loss.
-    
-    Args:
-        outputs: Model outputs dict with keys:
-            'sequence_probs', 'ptm_local_presence', 'ptm_local_offset',
-            'ptm_global_presence', 'ptm_global_offset'
-        targets: Target dict with keys:
-            'target_sequence', 'ptm_presence', 'ptm_offset',
-            'global_ptm_presence', 'global_ptm_offset'
-        loss_weights: Dict with keys ['seq', 'ptm_local', 'ptm_global']
-        pad_idx: Index of the padding token for sequence
-        label_smoothing: Label smoothing factor for cross-entropy
+    outputs dict: {
+        'sequence_probs': [batch, seq_len, vocab_size],
+        'ptm_local_presence': [batch, seq_len],  (logits)
+        'ptm_local_offset': [batch, seq_len],
+        'ptm_global_presence': [batch],          (logits)
+        'ptm_global_offset': [batch]
+    }
+    targets dict: {
+        'target_sequence': [batch, seq_len],
+        'ptm_presence': [batch, seq_len],   (0 or 1)
+        'ptm_offset': [batch, seq_len],
+        'global_ptm_presence': [batch,1] or [batch],
+        'global_ptm_offset': [batch,1] or [batch]
+    }
     """
-    # 1) Sequence prediction loss (cross-entropy with label smoothing)
+    # 1) Sequence prediction loss
     seq_loss = nn.CrossEntropyLoss(
-        ignore_index=pad_idx, 
+        ignore_index=pad_idx,
         label_smoothing=label_smoothing
     )(
         outputs['sequence_probs'].view(-1, outputs['sequence_probs'].size(-1)),
         targets['target_sequence'].view(-1)
     )
     
-    # 2) Local PTM presence (raw logits -> BCEWithLogitsLoss)
+    # 2) Local PTM presence -> raw logits + BCEWithLogits
+    ptm_local_presence_logits = outputs['ptm_local_presence']        # [batch, seq_len]
+    ptm_local_presence_target = targets['ptm_presence'].float()      # [batch, seq_len]
+    
     ptm_local_presence_loss = nn.BCEWithLogitsLoss()(
-        outputs['ptm_local_presence'].view(-1),
-        targets['ptm_presence'].view(-1).float()
+        ptm_local_presence_logits.view(-1),   # flatten
+        ptm_local_presence_target.view(-1)
     )
     
-    # Local PTM offset (only compute MSE where PTM_presence == 1)
-    ptm_mask = targets['ptm_presence'].float()  # shape: [batch, seq_len]
+    # 3) Local PTM offset -> MSE only where presence=1
+    ptm_mask = ptm_local_presence_target  # shape [batch, seq_len], 0 or 1
+    ptm_local_offset = outputs['ptm_local_offset']  # [batch, seq_len]
+    ptm_offset_target = targets['ptm_offset'].float()  # [batch, seq_len]
+    
     ptm_local_offset_loss = nn.MSELoss()(
-        outputs['ptm_local_offset'] * ptm_mask,  # zero out positions without PTM
-        targets['ptm_offset']       * ptm_mask
+        ptm_local_offset * ptm_mask,   # zero out non-PTM positions
+        ptm_offset_target * ptm_mask
     )
     
-    # 3) Global PTM presence (raw logits -> BCEWithLogitsLoss)
-    global_ptm_presence_output = outputs['ptm_global_presence']
-    global_ptm_presence_target = targets['global_ptm_presence'].float().squeeze(-1)
+    # 4) Global PTM presence -> raw logits + BCEWithLogits
+    global_ptm_presence_logits = outputs['ptm_global_presence']  # [batch] or [batch,1]
+    global_ptm_presence_target = targets['global_ptm_presence'].float()
+    if global_ptm_presence_target.dim() == 2 and global_ptm_presence_target.size(1) == 1:
+        # Squeeze to [batch]
+        global_ptm_presence_target = global_ptm_presence_target.squeeze(-1)
+    if global_ptm_presence_logits.dim() == 2 and global_ptm_presence_logits.size(1) == 1:
+        global_ptm_presence_logits = global_ptm_presence_logits.squeeze(-1)
     
     ptm_global_presence_loss = nn.BCEWithLogitsLoss()(
-        global_ptm_presence_output,
-        global_ptm_presence_target
+        global_ptm_presence_logits,   # [batch]
+        global_ptm_presence_target    # [batch]
     )
     
-    # 4) Global offset (only compute MSE if global PTM presence == 1)
-    global_ptm_offset_output = outputs['ptm_global_offset']
-    global_ptm_offset_target = targets['global_ptm_offset']
+    # 5) Global offset -> MSE only if presence=1
+    global_ptm_offset_output = outputs['ptm_global_offset']  # [batch] or [batch,1]
+    global_ptm_offset_target = targets['global_ptm_offset'].float()  # [batch] or [batch,1]
     
+    # Squeeze if needed
+    if global_ptm_offset_output.dim() == 2 and global_ptm_offset_output.size(1) == 1:
+        global_ptm_offset_output = global_ptm_offset_output.squeeze(-1)
+    if global_ptm_offset_target.dim() == 2 and global_ptm_offset_target.size(1) == 1:
+        global_ptm_offset_target = global_ptm_offset_target.squeeze(-1)
+    
+    # Multiply by presence=1 to zero out negative cases
     masked_global_offset_output = global_ptm_offset_output * global_ptm_presence_target
     masked_global_offset_target = global_ptm_offset_target * global_ptm_presence_target
     
@@ -135,14 +160,13 @@ def calculate_loss(outputs, targets, loss_weights, pad_idx=0, label_smoothing=0.
         masked_global_offset_target
     )
     
-    # Combine all losses
+    # Combine losses
     total_loss = (
-        loss_weights['seq'] * seq_loss +
-        loss_weights['ptm_local'] * (ptm_local_presence_loss + ptm_local_offset_loss) +
-        loss_weights['ptm_global'] * (ptm_global_presence_loss + ptm_global_offset_loss)
+        loss_weights['seq'] * seq_loss
+        + loss_weights['ptm_local'] * (ptm_local_presence_loss + ptm_local_offset_loss)
+        + loss_weights['ptm_global'] * (ptm_global_presence_loss + ptm_global_offset_loss)
     )
     
-    # Return a breakdown for logging
     loss_info = {
         'total': total_loss.item(),
         'seq': seq_loss.item(),
