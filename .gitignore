@@ -1,0 +1,6 @@
+/datasets/*
+/models/*
+.DS_Store
+.ipynb*
+__pycache__/
+/output/*
