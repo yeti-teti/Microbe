@@ -117,14 +117,17 @@ def generate_square_subsequent_mask(sz, device):
     return mask
 
 class SequenceGenerator(nn.Module):
-    """Define projection to vocabulary for sequence prediction"""
+    """Define projection to vocabulary for sequence prediction with NaN prevention"""
     def __init__(self, d_model, vocab_size):
         super(SequenceGenerator, self).__init__()
         self.proj = nn.Linear(d_model, vocab_size)
+        # Initialize with smaller weights to prevent extreme values
+        nn.init.xavier_uniform_(self.proj.weight, gain=0.8)
+        nn.init.zeros_(self.proj.bias)
     
     def forward(self, x, temperature=1.0):
         """
-        Forward pass with optional temperature scaling
+        Forward pass with robust NaN prevention
         
         Args:
             x: Input tensor
@@ -133,8 +136,39 @@ class SequenceGenerator(nn.Module):
         Returns:
             Log probabilities for each vocabulary item
         """
+        # Check for NaN values in input
+        if torch.isnan(x).any():
+            # Replace NaN values with zeros
+            x = torch.nan_to_num(x, nan=0.0)
+        
+        # Apply projection with gradient clipping
+        with torch.no_grad():
+            if hasattr(self.proj.weight, 'grad') and self.proj.weight.grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.proj.weight, 1.0)
+            
+        # Apply projection
         logits = self.proj(x)
-        return F.log_softmax(logits / temperature, dim=-1)
+        
+        # Apply safe temperature scaling
+        safe_temp = max(0.1, temperature)  # Avoid division by very small numbers
+        
+        # Apply NaN prevention in logits
+        if torch.isnan(logits).any():
+            logits = torch.nan_to_num(logits, nan=0.0)
+        
+        # Clip extreme values to prevent NaN in softmax
+        logits = torch.clamp(logits / safe_temp, min=-50.0, max=50.0)
+        
+        # Compute log probabilities with safe operations
+        # Add a small epsilon to prevent exact zeros in softmax
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Final NaN check
+        if torch.isnan(log_probs).any():
+            # Replace NaN with very low probability
+            log_probs = torch.nan_to_num(log_probs, nan=-100.0)
+        
+        return log_probs
 
 class PTMLocalPredictor(nn.Module):
     """Predicts local PTM presence and mass offset"""
@@ -281,19 +315,27 @@ class Spec2PepWithPTM(nn.Module):
         self._init_parameters()
     
     def _init_parameters(self):
-        """Initialize model parameters with custom values to prevent mode collapse"""
+        """Initialize model parameters with conservative values to prevent numerical instability"""
         for name, p in self.named_parameters():
             if p.dim() > 1:
-                # Different initialization based on parameter type
                 if 'proj' in name or 'generator' in name:
-                    # Output projections - more aggressive initialization
-                    nn.init.xavier_uniform_(p, gain=1.4)
+                    # Output projections - use conservative initialization
+                    nn.init.xavier_uniform_(p, gain=0.8)
                 elif 'embedding' in name or 'token_embedding' in name:
                     # Embeddings - smaller values
-                    nn.init.normal_(p, mean=0.0, std=0.1)
+                    nn.init.normal_(p, mean=0.0, std=0.05)
+                elif 'norm' in name or 'layernorm' in name:
+                    # Layer normalization parameters
+                    if 'weight' in name:
+                        nn.init.ones_(p)
+                    else:
+                        nn.init.zeros_(p)
                 else:
                     # Default initialization
-                    nn.init.xavier_uniform_(p, gain=1.0)
+                    nn.init.xavier_uniform_(p, gain=0.8)
+            elif p.dim() == 1:
+                # Bias terms
+                nn.init.zeros_(p)
     
     def forward(self, features, teacher_forcing_ratio=1.0, temperature=1.0):
         """

@@ -248,7 +248,7 @@ def train_one_epoch(
     temperature=1.0
 ):
     """
-    Train the model for one epoch with enhanced error handling.
+    Train the model for one epoch with enhanced error handling and NaN prevention.
     
     Args:
         model: The model to train
@@ -283,6 +283,12 @@ def train_one_epoch(
     successful_batches = 0
     failed_batches = 0
     
+    # Track consecutive NaN batches
+    consecutive_nan_batches = 0
+    
+    # Get initial learning rate
+    initial_lr = optimizer.param_groups[0]['lr']
+    
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -301,34 +307,51 @@ def train_one_epoch(
                 # Move targets to device
                 targets = {k: v.to(device) for k, v in targets.items()}
                 
-                # Forward pass
-                outputs = model(
+                # Safe forward pass with NaN detection
+                outputs, error_msg = safe_forward_pass(
+                    model, 
                     features, 
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     temperature=temperature
                 )
                 
-                # Validate tensors before loss calculation
-                valid, message = validate_tensors(outputs, targets)
-                if not valid:
-                    progress.console.log(f"[yellow]Batch {batch_idx} validation failed: {message}[/yellow]")
+                if error_msg is not None:
+                    progress.console.log(f"[yellow]Batch {batch_idx} forward pass issue: {error_msg}[/yellow]")
                     
-                    # Apply emergency fixes to the outputs
-                    if 'ptm_local_presence' in outputs:
-                        outputs['ptm_local_presence'] = torch.clamp(outputs['ptm_local_presence'], 1e-6, 1.0 - 1e-6)
+                    # Try again with more conservative settings
+                    progress.console.log("[yellow]Retrying with more conservative settings...[/yellow]")
+                    outputs, error_msg = safe_forward_pass(
+                        model, 
+                        features, 
+                        teacher_forcing_ratio=1.0,  # Full teacher forcing
+                        temperature=0.5            # Lower temperature
+                    )
                     
-                    if 'ptm_global_presence' in outputs:
-                        outputs['ptm_global_presence'] = torch.clamp(outputs['ptm_global_presence'], 1e-6, 1.0 - 1e-6)
-                    
-                    # Revalidate after fixes
-                    valid, message = validate_tensors(outputs, targets)
-                    if not valid:
-                        progress.console.log(f"[red]Emergency fixes failed: {message}. Skipping batch.[/red]")
+                    if error_msg is not None:
+                        progress.console.log(f"[red]Retry failed: {error_msg}. Skipping batch.[/red]")
                         failed_batches += 1
+                        consecutive_nan_batches += 1
+                        
+                        # If too many consecutive failures, reduce learning rate
+                        if consecutive_nan_batches >= 5:
+                            progress.console.log("[red]Too many consecutive failures. Reducing learning rate...[/red]")
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] *= 0.5
+                            progress.console.log(f"Learning rate reduced to {optimizer.param_groups[0]['lr']:.6f}")
+                            consecutive_nan_batches = 0
+                        
                         progress.update(train_task, advance=1)
                         continue
-                    
-                    progress.console.log(f"[green]Emergency fixes applied successfully.[/green]")
+                
+                # Reset consecutive NaN counter on success
+                consecutive_nan_batches = 0
+                
+                # Apply safety clamping to probability outputs
+                if 'ptm_local_presence' in outputs:
+                    outputs['ptm_local_presence'] = torch.clamp(outputs['ptm_local_presence'], 1e-6, 1.0 - 1e-6)
+                
+                if 'ptm_global_presence' in outputs:
+                    outputs['ptm_global_presence'] = torch.clamp(outputs['ptm_global_presence'], 1e-6, 1.0 - 1e-6)
                 
                 # Calculate loss
                 loss, batch_loss_info = calculate_loss(
@@ -339,15 +362,29 @@ def train_one_epoch(
                     label_smoothing
                 )
                 
+                # Check if loss is NaN
+                if torch.isnan(loss):
+                    progress.console.log(f"[red]Loss is NaN for batch {batch_idx}. Skipping.[/red]")
+                    failed_batches += 1
+                    consecutive_nan_batches += 1
+                    progress.update(train_task, advance=1)
+                    continue
+                
                 # Backward pass and optimize
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Check for NaN in gradients and fix if needed
+                has_nans, nan_info = check_and_handle_nans(model, optimizer, console=progress.console)
                 
                 # Apply gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 
                 optimizer.step()
-                scheduler.step()
+                
+                # Only step the scheduler if no NaNs were detected
+                if not has_nans:
+                    scheduler.step()
                 
                 # Accumulate losses
                 for k, v in batch_loss_info.items():
@@ -365,20 +402,34 @@ def train_one_epoch(
                 
             except Exception as e:
                 failed_batches += 1
+                consecutive_nan_batches += 1
                 progress.console.log(f"[red]Error in batch {batch_idx}: {type(e).__name__}: {str(e)}[/red]")
-                progress.update(train_task, advance=1)
                 
                 # Print more detailed information for debugging
                 import traceback
                 traceback.print_exc()
                 
+                # Reduce learning rate if many errors
+                if consecutive_nan_batches >= 5:
+                    progress.console.log("[red]Too many consecutive failures. Reducing learning rate...[/red]")
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] *= 0.5
+                    progress.console.log(f"Learning rate reduced to {optimizer.param_groups[0]['lr']:.6f}")
+                    consecutive_nan_batches = 0
+                
                 # Continue with next batch
+                progress.update(train_task, advance=1)
                 continue
     
     # Calculate averages (based on successful batches only)
     if successful_batches > 0:
         avg_loss_info = {k: v / successful_batches for k, v in loss_info_sum.items()}
         print(f"Epoch complete: {successful_batches} successful batches, {failed_batches} failed batches")
+        
+        # Check if learning rate was reduced substantially due to NaNs
+        final_lr = optimizer.param_groups[0]['lr']
+        if final_lr < initial_lr * 0.1:
+            print(f"[yellow]WARNING: Learning rate was reduced significantly from {initial_lr:.6f} to {final_lr:.6f} due to instability[/yellow]")
         
         return avg_loss_info['total'], avg_loss_info
     else:
