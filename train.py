@@ -233,6 +233,94 @@ def validate_tensors(outputs, targets):
     
     return True, "All checks passed"
 
+
+def check_and_handle_nans(model, optimizer, console=None):
+    """
+    Check for NaN values in model parameters and gradients, and handle them by:
+    1. Identifying modules with NaN values
+    2. Clipping gradients where NaNs were found
+    3. Reducing learning rate if NaNs are detected
+    4. Returning information about where NaNs were found
+    
+    Args:
+        model: The PyTorch model
+        optimizer: The optimizer
+        console: Optional rich console for logging
+        
+    Returns:
+        has_nans: True if NaNs were found, False otherwise
+        nan_info: Dictionary with information about where NaNs were found
+    """
+    has_nans = False
+    nan_info = {}
+    
+    # Check parameters
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            has_nans = True
+            nan_info[f"param:{name}"] = True
+            
+            # Replace NaNs with zeros
+            param.data = torch.nan_to_num(param.data, nan=0.0)
+        
+        # Check gradients if they exist
+        if param.grad is not None and torch.isnan(param.grad).any():
+            has_nans = True
+            nan_info[f"grad:{name}"] = True
+            
+            # Replace NaN gradients with zeros
+            param.grad = torch.nan_to_num(param.grad, nan=0.0)
+    
+    # If NaNs were found, reduce the learning rate
+    if has_nans:
+        if console:
+            console.log("[yellow]NaN values detected! Reducing learning rate...[/yellow]")
+        
+        # Reduce learning rate by factor of 0.5
+        for param_group in optimizer.param_groups:
+            param_group['lr'] *= 0.5
+            if console:
+                console.log(f"Learning rate reduced to {param_group['lr']:.6f}")
+        
+        # Apply more aggressive gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+    
+    return has_nans, nan_info
+
+def safe_forward_pass(model, features, teacher_forcing_ratio=1.0, temperature=1.0):
+    """
+    Execute model forward pass with NaN prevention and detection
+    
+    Args:
+        model: The model
+        features: Input features
+        teacher_forcing_ratio: Teacher forcing ratio
+        temperature: Temperature for softmax
+        
+    Returns:
+        outputs: Model outputs or None if forward pass failed
+        error_msg: Error message if forward pass failed, None otherwise
+    """
+    try:
+        # Try regular forward pass
+        outputs = model(features, teacher_forcing_ratio=teacher_forcing_ratio, temperature=temperature)
+        
+        # Check for NaN values in outputs
+        for key, tensor in outputs.items():
+            if torch.isnan(tensor).any():
+                # Try again with more stable settings
+                outputs = model(features, teacher_forcing_ratio=1.0, temperature=0.5)
+                
+                # Check again
+                if torch.isnan(outputs[key]).any():
+                    return None, f"NaN values detected in outputs['{key}']"
+        
+        return outputs, None
+        
+    except Exception as e:
+        return None, f"Forward pass failed: {type(e).__name__}: {str(e)}"
+
+
 def train_one_epoch(
     model, 
     dataloader, 
