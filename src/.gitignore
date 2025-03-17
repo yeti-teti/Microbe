@@ -1,4 +1,5 @@
-/datasets/*
+/datasets/*.msp
+/datasets/*.mgf
 /models/*
 .DS_Store
 .ipynb*
