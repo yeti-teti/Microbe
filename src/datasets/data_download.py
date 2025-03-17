@@ -13,4 +13,4 @@ url = "https://chemdata.nist.gov/download/peptide_library/libraries/human/HCD/20
 _ = urllib.request.urlretrieve(url, f"{library_file}.tar.gz")
 
 with tarfile.open(f"{library_file}.tar.gz") as f:
-    f.extractall("./datasets/")
+    f.extractall(".")
