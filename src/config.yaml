@@ -31,9 +31,12 @@ tb_summarywriter:
 # this field empty saves none.
 save_top_k: 5
 # Path to saved checkpoints.
-model_save_folder_path: "outputs"
+model_save_folder_path: "./outputs"
 # Model validation and checkpointing frequency in training steps.
-val_check_interval: 50_000
+#val_check_interval: 50_000
+val_check_interval: 50
+# eval_output
+output_eval: "eval_results.txt"
 
 # SPECTRUM PROCESSING OPTIONS
 # Number of the most intense peaks to retain, any remaining peaks are discarded.

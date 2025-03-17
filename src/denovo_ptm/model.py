@@ -127,50 +127,49 @@ class Spec2PepWithPTM(pl.LightningModule):
         )
     
     def beam_search_decode(
-            self, spectra: torch.Tensor, precursors: torch.Tensor
+        self, spectra: torch.Tensor, precursors: torch.Tensor
     ) -> List[List[Tuple[float, np.ndarray, str]]]:
-        
         memories, mem_masks = self.encoder(spectra)
-
+    
         # Sizes
         batch = spectra.shape[0]
         length = self.max_length + 1
         vocab = self.decoder.vocab_size + 1
         beam = self.n_beams
-
+    
         # Initializing the scores and tokens
         scores = torch.full(
-            size = (batch, length, vocab, beam), fill_value = torch.nan
+            size=(batch, length, vocab, beam), fill_value=torch.nan
         )
         scores = scores.type_as(spectra)
         tokens = torch.zeros(batch, length, beam, dtype=torch.int64)
         tokens = tokens.to(self.encoder.device)
-
+    
         # Create cache for decoded beams
         pred_cache = collections.OrderedDict((i, []) for i in range(batch))
-
+    
         # Get the first predictions
         pred, _ = self.decoder(None, precursors, memories, mem_masks)
         tokens[:, 0, :] = torch.topk(pred[:, 0, :], beam, dim=1)[1]
         scores[:, :1, :, :] = einops.repeat(pred, "B L V -> B L V S", S=beam)
-
-        # Make all tensors the right shapr for decoding
+    
+        # Make all tensors the right shape for decoding
         precursors = einops.repeat(precursors, "B L -> (B S) L", S=beam)
         mem_masks = einops.repeat(mem_masks, "B L -> (B S) L", S=beam)
         memories = einops.repeat(memories, "B L V -> (B S) L V", S=beam)
         tokens = einops.rearrange(tokens, "B L S -> (B S) L")
         scores = einops.rearrange(scores, "B L V S -> (B S) L V")
-
+    
         # Main decoding loop
         for step in range(0, self.max_length):
             # Terminate beams exceeding the precursor m/z tolerance and track
             # all finished beams (either terminated or stop token predicted).
             (
-                finished_beams, 
-                beam_fits_precursor, 
-                discarded_beams, 
-            ) = self.__finish_beams(tokens, precursors, step)
-
+                finished_beams,
+                beam_fits_precursor,
+                discarded_beams,
+            ) = self._finish_beams(tokens, precursors, step)
+    
             # Cache peptide predictions from the finished beams (but not the discarded beams)
             self._cache_finished_beams(
                 tokens,
@@ -180,21 +179,44 @@ class Spec2PepWithPTM(pl.LightningModule):
                 beam_fits_precursor,
                 pred_cache,
             )
-
+    
             finished_beams |= discarded_beams
-            scores[~finished_beams, : step + 2, :], _ = self.decoder(
-                tokens[~finished_beams, : step + 1],
-                precursors[~finished_beams, :],
-                memories[~finished_beams, :, :],
-                mem_masks[~finished_beams, :],
-            )
-
-            # Find the top-k beams with the highest scores and continue decoding those.
-            tokens, scores = self._get_topk_beams(
-                tokens, scores, finished_beams, batch, step + 1
-            )
-
-        # Return the peptide with the highest confidence score, within the precursor m/z tolerance if possible.
+    
+            # If all beams are finished, break early
+            if finished_beams.all():
+                break
+    
+            # Continue decoding only if there are active beams
+            if torch.any(~finished_beams):
+                next_preds, _ = self.decoder(
+                    tokens[~finished_beams, : step + 1],
+                    precursors[~finished_beams, :],
+                    memories[~finished_beams, :, :],
+                    mem_masks[~finished_beams, :],
+                )
+                scores[~finished_beams, : step + 2, :] = next_preds
+    
+                # Find the top-k beams with the highest scores and continue decoding those
+                tokens, scores = self._get_topk_beams(
+                    tokens, scores, finished_beams, batch, step + 1
+                )
+            else:
+                break
+    
+        # Ensure at least one prediction per spectrum, even if incomplete
+        for i in range(batch):
+            if not pred_cache[i]:  # If no predictions cached
+                pred_tokens = tokens[i * beam, :self.max_length]
+                peptide = self.decoder.detokenize(pred_tokens)
+                if peptide and peptide[-1] == "$":
+                    peptide = peptide[:-1]
+                if len(peptide) >= self.min_peptide_len:
+                    smx = self.softmax(scores[i * beam : i * beam + 1, :self.max_length, :])
+                    aa_scores = smx[0, range(len(pred_tokens)), pred_tokens].tolist()
+                    aa_scores, peptide_score = _aa_pep_score(np.asarray(aa_scores), False)
+                    pred_cache[i].append((peptide_score, np.random.random_sample(), aa_scores[:-1], pred_tokens))
+    
+        # Return the peptide with the highest confidence score, within the precursor m/z tolerance if possible
         return list(self._get_top_peptide(pred_cache))
     
 

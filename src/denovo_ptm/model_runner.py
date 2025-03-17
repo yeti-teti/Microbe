@@ -20,6 +20,10 @@ from .dataloaders import DeNovoDataModule
 from .model import Spec2PepWithPTM
 
 
+import numpy.core.multiarray
+
+torch.serialization.add_safe_globals([np.core.multiarray.scalar, np.dtypes.Float64DType, np.dtype])
+
 logger = logging.getLogger("ptm")
 
 class ModelRunner:
@@ -84,15 +88,33 @@ class ModelRunner:
             self.loaders.val_dataloader(),
         )
 
-    def evaluate(self, peak_path: Iterable[str]) -> None:
+    def evaluate(self, peak_path: Iterable[str], output_eval: str = None) -> None:
         self.initialize_trainer(train=False)
         self.initialize_model(train=False)
-
+    
         test_index = self._get_index(peak_path, True, "evaluation")
         self.initialize_data_module(test_index=test_index)
         self.loaders.setup(stage="test", annotated=True)
-
-        self.trainer.validate(self.model, self.loaders.test_dataloader())
+    
+        # Run validation and capture metrics
+        metrics = self.trainer.validate(self.model, self.loaders.test_dataloader())
+    
+        # Handle metrics as a list of dictionaries
+        if isinstance(metrics, list) and len(metrics) > 0:
+            # Assuming single dataloader, take the first dictionary
+            metrics_dict = metrics[0]
+        else:
+            metrics_dict = metrics  # Fallback if it's already a dict (unlikely here)
+    
+        # Write metrics to the output file if specified
+        if output_eval:
+            try:
+                with open(output_eval, 'w') as f:
+                    for key, value in metrics_dict.items():
+                        f.write(f"{key}: {value}\n")
+            except Exception as e:
+                logger.error(f"Failed to write to {output_eval}: {e}")
+                raise
     
     def predict(self, peak_path: Iterable[str], output: str) -> None:
         self.writer = ms_io.MztabWriter(Path(output).with_suffix(".mztab"))
@@ -223,7 +245,6 @@ class ModelRunner:
                         "using the checkpoint."
                     )
         except RuntimeError:
-            # This only doesn't work if the weights are from an older version
             try:
                 self.model = Spec2PepWithPTM.load_from_checkpoint(
                     self.model_filename,
