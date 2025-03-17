@@ -1,0 +1,17 @@
+appdirs
+lightning==2.0
+click
+depthcharge-ms==0.2.3
+natsort
+numpy<2.0
+pandas
+psutil
+PyGithub
+PyYAML
+requests
+rich-click>=1.6.1
+scikit-learn
+spectrum_utils
+tensorboard
+torch>=2.1
+tqdm

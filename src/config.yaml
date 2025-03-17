@@ -1,0 +1,458 @@
+# Max absolute difference allowed with respect to observed precursor m/z.
+# Predictions outside the tolerance range are assigned a negative peptide score.
+precursor_mass_tol: 50  # ppm
+# Isotopes to consider when comparing predicted and observed precursor m/z's.
+isotope_error_range: [0, 1]
+# The minimum length of predicted peptides.
+min_peptide_len: 6
+# Number of spectra in one inference batch.
+predict_batch_size: 1024
+# Number of beams used in beam search.
+n_beams: 1
+# Number of PSMs for each spectrum.
+top_match: 1
+# The hardware accelerator to use. Must be one of:
+# "cpu", "gpu", "tpu", "ipu", "hpu", "mps", or "auto".
+accelerator: "auto"
+# The devices to use. Can be set to a positive number int, or the value -1 to
+# indicate all available devices should be used. If left empty, the appropriate
+# number will be automatically selected for based on the chosen accelerator.
+devices:
+
+# Random seed to ensure reproducible results.
+random_seed: 454
+
+# OUTPUT OPTIONS
+# Logging frequency in training steps.
+n_log: 1
+# Tensorboard directory to use for keeping track of training metrics.
+tb_summarywriter:
+# Save the top k model checkpoints during training. -1 saves all, and leaving
+# this field empty saves none.
+save_top_k: 5
+# Path to saved checkpoints.
+model_save_folder_path: ""
+# Model validation and checkpointing frequency in training steps.
+val_check_interval: 50_000
+
+# SPECTRUM PROCESSING OPTIONS
+# Number of the most intense peaks to retain, any remaining peaks are discarded.
+n_peaks: 150
+# Min peak m/z allowed, peaks with smaller m/z are discarded.
+min_mz: 50.0
+# Max peak m/z allowed, peaks with larger m/z are discarded.
+max_mz: 2500.0
+# Min peak intensity allowed, less intense peaks are discarded.
+min_intensity: 0.01
+# Max absolute m/z difference allowed when removing the precursor peak.
+remove_precursor_tol: 2.0  # Da
+# Max precursor charge allowed, spectra with larger charge are skipped.
+max_charge: 10
+
+# MODEL ARCHITECTURE OPTIONS
+# Dimensionality of latent representations, i.e. peak embeddings.
+dim_model: 512
+# Number of attention heads.
+n_head: 8
+# Dimensionality of fully connected layers.
+dim_feedforward: 1024
+# Number of transformer layers in spectrum encoder and peptide decoder.
+n_layers: 9
+# Dropout rate for model weights.
+dropout: 0.0
+# Number of dimensions to use for encoding peak intensity.
+# Projected up to `dim_model` by default and summed with the peak m/z encoding.
+dim_intensity:
+# Max decoded peptide length.
+max_length: 100
+# The number of iterations for the linear warm-up of the learning rate.
+warmup_iters: 100_000
+# The number of iterations for the cosine half period of the learning rate.
+cosine_schedule_period_iters: 600_000
+# Learning rate for weight updates during training.
+learning_rate: 5e-4
+# Regularization term for weight updates.
+weight_decay: 1e-5
+# Amount of label smoothing when computing the training loss.
+train_label_smoothing: 0.01
+
+# TRAINING/INFERENCE OPTIONS
+# Number of spectra in one training batch.
+train_batch_size: 32
+# Max number of training epochs.
+max_epochs: 30
+# Number of validation steps to run before training begins.
+num_sanity_val_steps: 0
+# Calculate peptide and amino acid precision during training.
+# This is expensive, so we recommend against it.
+calculate_precision: False
+
+# AMINO ACID AND MODIFICATION VOCABULARY
+residues:
+  # Standard amino acids
+  "G": 57.021464
+  "A": 71.037114
+  "S": 87.032028
+  "P": 97.052764
+  "V": 99.068414
+  "T": 101.047670
+  "C": 103.009185
+  "L": 113.084064
+  "I": 113.084064
+  "N": 114.042927
+  "D": 115.026943
+  "Q": 128.058578
+  "K": 128.094963
+  "E": 129.042593
+  "M": 131.040485
+  "H": 137.058912
+  "F": 147.068414
+  "R": 156.101111
+  "Y": 163.063329
+  "W": 186.079313
+  
+  # Carbamidomethylation (CAM: +57.02146) on all amino acids
+  "G+57.02146": 114.042924  # 57.021464 + 57.02146
+  "A+57.02146": 128.058574  # 71.037114 + 57.02146
+  "S+57.02146": 144.053488  # 87.032028 + 57.02146
+  "P+57.02146": 154.074224  # 97.052764 + 57.02146
+  "V+57.02146": 156.089874  # 99.068414 + 57.02146
+  "T+57.02146": 158.069130  # 101.047670 + 57.02146
+  "C+57.02146": 160.030645  # 103.009185 + 57.02146
+  "L+57.02146": 170.105524  # 113.084064 + 57.02146
+  "I+57.02146": 170.105524  # 113.084064 + 57.02146
+  "N+57.02146": 171.064387  # 114.042927 + 57.02146
+  "D+57.02146": 172.048403  # 115.026943 + 57.02146
+  "Q+57.02146": 185.080038  # 128.058578 + 57.02146
+  "K+57.02146": 185.116423  # 128.094963 + 57.02146
+  "E+57.02146": 186.064053  # 129.042593 + 57.02146
+  "M+57.02146": 188.061945  # 131.040485 + 57.02146
+  "H+57.02146": 194.080372  # 137.058912 + 57.02146
+  "F+57.02146": 204.089874  # 147.068414 + 57.02146
+  "R+57.02146": 213.122571  # 156.101111 + 57.02146
+  "Y+57.02146": 220.084789  # 163.063329 + 57.02146
+  "W+57.02146": 243.100773  # 186.079313 + 57.02146
+  
+  # Oxidation (+15.994915) on all amino acids
+  "G+15.994915": 73.016379  # 57.021464 + 15.994915
+  "A+15.994915": 87.032029  # 71.037114 + 15.994915
+  "S+15.994915": 103.026943  # 87.032028 + 15.994915
+  "P+15.994915": 113.047679  # 97.052764 + 15.994915
+  "V+15.994915": 115.063329  # 99.068414 + 15.994915
+  "T+15.994915": 117.042585  # 101.047670 + 15.994915
+  "C+15.994915": 119.004100  # 103.009185 + 15.994915
+  "L+15.994915": 129.078979  # 113.084064 + 15.994915
+  "I+15.994915": 129.078979  # 113.084064 + 15.994915
+  "N+15.994915": 130.037842  # 114.042927 + 15.994915
+  "D+15.994915": 131.021858  # 115.026943 + 15.994915
+  "Q+15.994915": 144.053493  # 128.058578 + 15.994915
+  "K+15.994915": 144.089878  # 128.094963 + 15.994915
+  "E+15.994915": 145.037508  # 129.042593 + 15.994915
+  "M+15.994915": 147.035400  # 131.040485 + 15.994915
+  "H+15.994915": 153.053827  # 137.058912 + 15.994915
+  "F+15.994915": 163.063329  # 147.068414 + 15.994915
+  "R+15.994915": 172.096026  # 156.101111 + 15.994915
+  "Y+15.994915": 179.058244  # 163.063329 + 15.994915
+  "W+15.994915": 202.074228  # 186.079313 + 15.994915
+  
+  # Acetylation (+42.010565) on all amino acids
+  "G+42.010565": 99.032029  # 57.021464 + 42.010565
+  "A+42.010565": 113.047679  # 71.037114 + 42.010565
+  "S+42.010565": 129.042593  # 87.032028 + 42.010565
+  "P+42.010565": 139.063329  # 97.052764 + 42.010565
+  "V+42.010565": 141.078979  # 99.068414 + 42.010565
+  "T+42.010565": 143.058235  # 101.047670 + 42.010565
+  "C+42.010565": 145.019750  # 103.009185 + 42.010565
+  "L+42.010565": 155.094629  # 113.084064 + 42.010565
+  "I+42.010565": 155.094629  # 113.084064 + 42.010565
+  "N+42.010565": 156.053492  # 114.042927 + 42.010565
+  "D+42.010565": 157.037508  # 115.026943 + 42.010565
+  "Q+42.010565": 170.069143  # 128.058578 + 42.010565
+  "K+42.010565": 170.105528  # 128.094963 + 42.010565
+  "E+42.010565": 171.053158  # 129.042593 + 42.010565
+  "M+42.010565": 173.051050  # 131.040485 + 42.010565
+  "H+42.010565": 179.069477  # 137.058912 + 42.010565
+  "F+42.010565": 189.078979  # 147.068414 + 42.010565
+  "R+42.010565": 198.111676  # 156.101111 + 42.010565
+  "Y+42.010565": 205.073894  # 163.063329 + 42.010565
+  "W+42.010565": 228.089878  # 186.079313 + 42.010565
+  
+  # Common precision variants
+  "C+57.021": 160.030645  # Alternative to C+57.02146
+  "M+15.995": 147.035400  # Alternative to M+15.994915
+  "K+42.011": 170.105528  # Alternative to K+42.010565
+  
+  # Combined PTMs - Two modifications
+  # CAM and Acetylation - both permutations
+  "C+57.02146+42.010565": 202.041210  # C + CAM + Acetylation
+  "C+42.010565+57.02146": 202.041210  # C + Acetylation + CAM (the one causing error)
+  "G+57.02146+42.010565": 156.053489  # G + CAM + Acetylation
+  "G+42.010565+57.02146": 156.053489  # G + Acetylation + CAM
+  "A+57.02146+42.010565": 170.069139  # A + CAM + Acetylation
+  "A+42.010565+57.02146": 170.069139  # A + Acetylation + CAM
+  "S+57.02146+42.010565": 186.064053  # S + CAM + Acetylation
+  "S+42.010565+57.02146": 186.064053  # S + Acetylation + CAM
+  "P+57.02146+42.010565": 196.084789  # P + CAM + Acetylation
+  "P+42.010565+57.02146": 196.084789  # P + Acetylation + CAM
+  "V+57.02146+42.010565": 198.100439  # V + CAM + Acetylation
+  "V+42.010565+57.02146": 198.100439  # V + Acetylation + CAM
+  "T+57.02146+42.010565": 200.079695  # T + CAM + Acetylation
+  "T+42.010565+57.02146": 200.079695  # T + Acetylation + CAM
+  "L+57.02146+42.010565": 212.116089  # L + CAM + Acetylation
+  "L+42.010565+57.02146": 212.116089  # L + Acetylation + CAM
+  "I+57.02146+42.010565": 212.116089  # I + CAM + Acetylation
+  "I+42.010565+57.02146": 212.116089  # I + Acetylation + CAM
+  "N+57.02146+42.010565": 213.074952  # N + CAM + Acetylation
+  "N+42.010565+57.02146": 213.074952  # N + Acetylation + CAM
+  "D+57.02146+42.010565": 214.058968  # D + CAM + Acetylation
+  "D+42.010565+57.02146": 214.058968  # D + Acetylation + CAM
+  "Q+57.02146+42.010565": 227.090603  # Q + CAM + Acetylation
+  "Q+42.010565+57.02146": 227.090603  # Q + Acetylation + CAM
+  "K+57.02146+42.010565": 227.126988  # K + CAM + Acetylation
+  "K+42.010565+57.02146": 227.126988  # K + Acetylation + CAM
+  "E+57.02146+42.010565": 228.074618  # E + CAM + Acetylation
+  "E+42.010565+57.02146": 228.074618  # E + Acetylation + CAM
+  "M+57.02146+42.010565": 230.072510  # M + CAM + Acetylation
+  "M+42.010565+57.02146": 230.072510  # M + Acetylation + CAM
+  "H+57.02146+42.010565": 236.090937  # H + CAM + Acetylation
+  "H+42.010565+57.02146": 236.090937  # H + Acetylation + CAM
+  "F+57.02146+42.010565": 246.100439  # F + CAM + Acetylation
+  "F+42.010565+57.02146": 246.100439  # F + Acetylation + CAM
+  "R+57.02146+42.010565": 255.133136  # R + CAM + Acetylation
+  "R+42.010565+57.02146": 255.133136  # R + Acetylation + CAM
+  "Y+57.02146+42.010565": 262.095354  # Y + CAM + Acetylation
+  "Y+42.010565+57.02146": 262.095354  # Y + Acetylation + CAM
+  "W+57.02146+42.010565": 285.111338  # W + CAM + Acetylation
+  "W+42.010565+57.02146": 285.111338  # W + Acetylation + CAM
+  
+  # CAM and Oxidation - both permutations
+  "G+57.02146+15.994915": 130.037839  # G + CAM + Oxidation
+  "G+15.994915+57.02146": 130.037839  # G + Oxidation + CAM
+  "A+57.02146+15.994915": 144.053489  # A + CAM + Oxidation
+  "A+15.994915+57.02146": 144.053489  # A + Oxidation + CAM
+  "S+57.02146+15.994915": 160.048403  # S + CAM + Oxidation
+  "S+15.994915+57.02146": 160.048403  # S + Oxidation + CAM
+  "P+57.02146+15.994915": 170.069139  # P + CAM + Oxidation
+  "P+15.994915+57.02146": 170.069139  # P + Oxidation + CAM
+  "V+57.02146+15.994915": 172.084789  # V + CAM + Oxidation
+  "V+15.994915+57.02146": 172.084789  # V + Oxidation + CAM
+  "T+57.02146+15.994915": 174.064045  # T + CAM + Oxidation
+  "T+15.994915+57.02146": 174.064045  # T + Oxidation + CAM
+  "C+57.02146+15.994915": 176.025560  # C + CAM + Oxidation
+  "C+15.994915+57.02146": 176.025560  # C + Oxidation + CAM
+  "L+57.02146+15.994915": 186.100439  # L + CAM + Oxidation
+  "L+15.994915+57.02146": 186.100439  # L + Oxidation + CAM
+  "I+57.02146+15.994915": 186.100439  # I + CAM + Oxidation
+  "I+15.994915+57.02146": 186.100439  # I + Oxidation + CAM
+  "N+57.02146+15.994915": 187.059302  # N + CAM + Oxidation
+  "N+15.994915+57.02146": 187.059302  # N + Oxidation + CAM
+  "D+57.02146+15.994915": 188.043318  # D + CAM + Oxidation
+  "D+15.994915+57.02146": 188.043318  # D + Oxidation + CAM
+  "Q+57.02146+15.994915": 201.074953  # Q + CAM + Oxidation
+  "Q+15.994915+57.02146": 201.074953  # Q + Oxidation + CAM
+  "K+57.02146+15.994915": 201.111338  # K + CAM + Oxidation
+  "K+15.994915+57.02146": 201.111338  # K + Oxidation + CAM
+  "E+57.02146+15.994915": 202.058968  # E + CAM + Oxidation
+  "E+15.994915+57.02146": 202.058968  # E + Oxidation + CAM
+  "M+57.02146+15.994915": 204.056860  # M + CAM + Oxidation
+  "M+15.994915+57.02146": 204.056860  # M + Oxidation + CAM
+  "H+57.02146+15.994915": 210.075287  # H + CAM + Oxidation
+  "H+15.994915+57.02146": 210.075287  # H + Oxidation + CAM
+  "F+57.02146+15.994915": 220.084789  # F + CAM + Oxidation
+  "F+15.994915+57.02146": 220.084789  # F + Oxidation + CAM
+  "R+57.02146+15.994915": 229.117486  # R + CAM + Oxidation
+  "R+15.994915+57.02146": 229.117486  # R + Oxidation + CAM
+  "Y+57.02146+15.994915": 236.079704  # Y + CAM + Oxidation
+  "Y+15.994915+57.02146": 236.079704  # Y + Oxidation + CAM
+  "W+57.02146+15.994915": 259.095688  # W + CAM + Oxidation
+  "W+15.994915+57.02146": 259.095688  # W + Oxidation + CAM
+  
+  # Oxidation and Acetylation - both permutations
+  "G+15.994915+42.010565": 115.026944  # G + Oxidation + Acetylation
+  "G+42.010565+15.994915": 115.026944  # G + Acetylation + Oxidation
+  "A+15.994915+42.010565": 129.042594  # A + Oxidation + Acetylation
+  "A+42.010565+15.994915": 129.042594  # A + Acetylation + Oxidation
+  "S+15.994915+42.010565": 145.037508  # S + Oxidation + Acetylation
+  "S+42.010565+15.994915": 145.037508  # S + Acetylation + Oxidation
+  "P+15.994915+42.010565": 155.058244  # P + Oxidation + Acetylation
+  "P+42.010565+15.994915": 155.058244  # P + Acetylation + Oxidation
+  "V+15.994915+42.010565": 157.073894  # V + Oxidation + Acetylation
+  "V+42.010565+15.994915": 157.073894  # V + Acetylation + Oxidation
+  "T+15.994915+42.010565": 159.053150  # T + Oxidation + Acetylation
+  "T+42.010565+15.994915": 159.053150  # T + Acetylation + Oxidation
+  "C+15.994915+42.010565": 161.014665  # C + Oxidation + Acetylation
+  "C+42.010565+15.994915": 161.014665  # C + Acetylation + Oxidation
+  "L+15.994915+42.010565": 171.089544  # L + Oxidation + Acetylation
+  "L+42.010565+15.994915": 171.089544  # L + Acetylation + Oxidation
+  "I+15.994915+42.010565": 171.089544  # I + Oxidation + Acetylation
+  "I+42.010565+15.994915": 171.089544  # I + Acetylation + Oxidation
+  "N+15.994915+42.010565": 172.048407  # N + Oxidation + Acetylation
+  "N+42.010565+15.994915": 172.048407  # N + Acetylation + Oxidation
+  "D+15.994915+42.010565": 173.032423  # D + Oxidation + Acetylation
+  "D+42.010565+15.994915": 173.032423  # D + Acetylation + Oxidation
+  "Q+15.994915+42.010565": 186.064058  # Q + Oxidation + Acetylation
+  "Q+42.010565+15.994915": 186.064058  # Q + Acetylation + Oxidation
+  "K+15.994915+42.010565": 186.100443  # K + Oxidation + Acetylation
+  "K+42.010565+15.994915": 186.100443  # K + Acetylation + Oxidation
+  "E+15.994915+42.010565": 187.048073  # E + Oxidation + Acetylation
+  "E+42.010565+15.994915": 187.048073  # E + Acetylation + Oxidation
+  "M+15.994915+42.010565": 189.045965  # M + Oxidation + Acetylation
+  "M+42.010565+15.994915": 189.045965  # M + Acetylation + Oxidation
+  "H+15.994915+42.010565": 195.064392  # H + Oxidation + Acetylation
+  "H+42.010565+15.994915": 195.064392  # H + Acetylation + Oxidation
+  "F+15.994915+42.010565": 205.073894  # F + Oxidation + Acetylation
+  "F+42.010565+15.994915": 205.073894  # F + Acetylation + Oxidation
+  "R+15.994915+42.010565": 214.106591  # R + Oxidation + Acetylation
+  "R+42.010565+15.994915": 214.106591  # R + Acetylation + Oxidation
+  "Y+15.994915+42.010565": 221.068809  # Y + Oxidation + Acetylation
+  "Y+42.010565+15.994915": 221.068809  # Y + Acetylation + Oxidation
+  "W+15.994915+42.010565": 244.084793  # W + Oxidation + Acetylation
+  "W+42.010565+15.994915": 244.084793  # W + Acetylation + Oxidation
+  
+  # Triple modifications - All six permutations for each amino acid
+  "G+57.02146+15.994915+42.010565": 172.048404  # G + CAM + Oxidation + Acetylation
+  "G+57.02146+42.010565+15.994915": 172.048404  # G + CAM + Acetylation + Oxidation
+  "G+15.994915+57.02146+42.010565": 172.048404  # G + Oxidation + CAM + Acetylation
+  "G+15.994915+42.010565+57.02146": 172.048404  # G + Oxidation + Acetylation + CAM
+  "G+42.010565+57.02146+15.994915": 172.048404  # G + Acetylation + CAM + Oxidation
+  "G+42.010565+15.994915+57.02146": 172.048404  # G + Acetylation + Oxidation + CAM
+  
+  "A+57.02146+15.994915+42.010565": 186.064054  # A + CAM + Oxidation + Acetylation
+  "A+57.02146+42.010565+15.994915": 186.064054  # A + CAM + Acetylation + Oxidation
+  "A+15.994915+57.02146+42.010565": 186.064054  # A + Oxidation + CAM + Acetylation
+  "A+15.994915+42.010565+57.02146": 186.064054  # A + Oxidation + Acetylation + CAM
+  "A+42.010565+57.02146+15.994915": 186.064054  # A + Acetylation + CAM + Oxidation
+  "A+42.010565+15.994915+57.02146": 186.064054  # A + Acetylation + Oxidation + CAM
+  
+  "S+57.02146+15.994915+42.010565": 202.058968  # S + CAM + Oxidation + Acetylation
+  "S+57.02146+42.010565+15.994915": 202.058968  # S + CAM + Acetylation + Oxidation
+  "S+15.994915+57.02146+42.010565": 202.058968  # S + Oxidation + CAM + Acetylation
+  "S+15.994915+42.010565+57.02146": 202.058968  # S + Oxidation + Acetylation + CAM
+  "S+42.010565+57.02146+15.994915": 202.058968  # S + Acetylation + CAM + Oxidation
+  "S+42.010565+15.994915+57.02146": 202.058968  # S + Acetylation + Oxidation + CAM
+  
+  "P+57.02146+15.994915+42.010565": 212.079704  # P + CAM + Oxidation + Acetylation
+  "P+57.02146+42.010565+15.994915": 212.079704  # P + CAM + Acetylation + Oxidation
+  "P+15.994915+57.02146+42.010565": 212.079704  # P + Oxidation + CAM + Acetylation
+  "P+15.994915+42.010565+57.02146": 212.079704  # P + Oxidation + Acetylation + CAM
+  "P+42.010565+57.02146+15.994915": 212.079704  # P + Acetylation + CAM + Oxidation
+  "P+42.010565+15.994915+57.02146": 212.079704  # P + Acetylation + Oxidation + CAM
+  
+  "V+57.02146+15.994915+42.010565": 214.095354  # V + CAM + Oxidation + Acetylation
+  "V+57.02146+42.010565+15.994915": 214.095354  # V + CAM + Acetylation + Oxidation
+  "V+15.994915+57.02146+42.010565": 214.095354  # V + Oxidation + CAM + Acetylation
+  "V+15.994915+42.010565+57.02146": 214.095354  # V + Oxidation + Acetylation + CAM
+  "V+42.010565+57.02146+15.994915": 214.095354  # V + Acetylation + CAM + Oxidation
+  "V+42.010565+15.994915+57.02146": 214.095354  # V + Acetylation + Oxidation + CAM
+  
+  "T+57.02146+15.994915+42.010565": 216.074610  # T + CAM + Oxidation + Acetylation
+  "T+57.02146+42.010565+15.994915": 216.074610  # T + CAM + Acetylation + Oxidation
+  "T+15.994915+57.02146+42.010565": 216.074610  # T + Oxidation + CAM + Acetylation
+  "T+15.994915+42.010565+57.02146": 216.074610  # T + Oxidation + Acetylation + CAM
+  "T+42.010565+57.02146+15.994915": 216.074610  # T + Acetylation + CAM + Oxidation
+  "T+42.010565+15.994915+57.02146": 216.074610  # T + Acetylation + Oxidation + CAM
+  
+  "C+57.02146+15.994915+42.010565": 218.036125  # C + CAM + Oxidation + Acetylation
+  "C+57.02146+42.010565+15.994915": 218.036125  # C + CAM + Acetylation + Oxidation
+  "C+15.994915+57.02146+42.010565": 218.036125  # C + Oxidation + CAM + Acetylation
+  "C+15.994915+42.010565+57.02146": 218.036125  # C + Oxidation + Acetylation + CAM
+  "C+42.010565+57.02146+15.994915": 218.036125  # C + Acetylation + CAM + Oxidation
+  "C+42.010565+15.994915+57.02146": 218.036125  # C + Acetylation + Oxidation + CAM
+  
+  "L+57.02146+15.994915+42.010565": 228.111004  # L + CAM + Oxidation + Acetylation
+  "L+57.02146+42.010565+15.994915": 228.111004  # L + CAM + Acetylation + Oxidation
+  "L+15.994915+57.02146+42.010565": 228.111004  # L + Oxidation + CAM + Acetylation
+  "L+15.994915+42.010565+57.02146": 228.111004  # L + Oxidation + Acetylation + CAM
+  "L+42.010565+57.02146+15.994915": 228.111004  # L + Acetylation + CAM + Oxidation
+  "L+42.010565+15.994915+57.02146": 228.111004  # L + Acetylation + Oxidation + CAM
+  
+  "I+57.02146+15.994915+42.010565": 228.111004  # I + CAM + Oxidation + Acetylation
+  "I+57.02146+42.010565+15.994915": 228.111004  # I + CAM + Acetylation + Oxidation
+  "I+15.994915+57.02146+42.010565": 228.111004  # I + Oxidation + CAM + Acetylation
+  "I+15.994915+42.010565+57.02146": 228.111004  # I + Oxidation + Acetylation + CAM
+  "I+42.010565+57.02146+15.994915": 228.111004  # I + Acetylation + CAM + Oxidation
+  "I+42.010565+15.994915+57.02146": 228.111004  # I + Acetylation + Oxidation + CAM
+  
+  "N+57.02146+15.994915+42.010565": 229.069867  # N + CAM + Oxidation + Acetylation
+  "N+57.02146+42.010565+15.994915": 229.069867  # N + CAM + Acetylation + Oxidation
+  "N+15.994915+57.02146+42.010565": 229.069867  # N + Oxidation + CAM + Acetylation
+  "N+15.994915+42.010565+57.02146": 229.069867  # N + Oxidation + Acetylation + CAM
+  "N+42.010565+57.02146+15.994915": 229.069867  # N + Acetylation + CAM + Oxidation
+  "N+42.010565+15.994915+57.02146": 229.069867  # N + Acetylation + Oxidation + CAM
+  
+  "D+57.02146+15.994915+42.010565": 230.053883  # D + CAM + Oxidation + Acetylation
+  "D+57.02146+42.010565+15.994915": 230.053883  # D + CAM + Acetylation + Oxidation
+  "D+15.994915+57.02146+42.010565": 230.053883  # D + Oxidation + CAM + Acetylation
+  "D+15.994915+42.010565+57.02146": 230.053883  # D + Oxidation + Acetylation + CAM
+  "D+42.010565+57.02146+15.994915": 230.053883  # D + Acetylation + CAM + Oxidation
+  "D+42.010565+15.994915+57.02146": 230.053883  # D + Acetylation + Oxidation + CAM
+  
+  "Q+57.02146+15.994915+42.010565": 243.085518  # Q + CAM + Oxidation + Acetylation
+  "Q+57.02146+42.010565+15.994915": 243.085518  # Q + CAM + Acetylation + Oxidation
+  "Q+15.994915+57.02146+42.010565": 243.085518  # Q + Oxidation + CAM + Acetylation
+  "Q+15.994915+42.010565+57.02146": 243.085518  # Q + Oxidation + Acetylation + CAM
+  "Q+42.010565+57.02146+15.994915": 243.085518  # Q + Acetylation + CAM + Oxidation
+  "Q+42.010565+15.994915+57.02146": 243.085518  # Q + Acetylation + Oxidation + CAM
+  
+  "K+57.02146+15.994915+42.010565": 243.121903  # K + CAM + Oxidation + Acetylation
+  "K+57.02146+42.010565+15.994915": 243.121903  # K + CAM + Acetylation + Oxidation
+  "K+15.994915+57.02146+42.010565": 243.121903  # K + Oxidation + CAM + Acetylation
+  "K+15.994915+42.010565+57.02146": 243.121903  # K + Oxidation + Acetylation + CAM
+  "K+42.010565+57.02146+15.994915": 243.121903  # K + Acetylation + CAM + Oxidation
+  "K+42.010565+15.994915+57.02146": 243.121903  # K + Acetylation + Oxidation + CAM
+  
+  "E+57.02146+15.994915+42.010565": 244.069533  # E + CAM + Oxidation + Acetylation
+  "E+57.02146+42.010565+15.994915": 244.069533  # E + CAM + Acetylation + Oxidation
+  "E+15.994915+57.02146+42.010565": 244.069533  # E + Oxidation + CAM + Acetylation
+  "E+15.994915+42.010565+57.02146": 244.069533  # E + Oxidation + Acetylation + CAM
+  "E+42.010565+57.02146+15.994915": 244.069533  # E + Acetylation + CAM + Oxidation
+  "E+42.010565+15.994915+57.02146": 244.069533  # E + Acetylation + Oxidation + CAM
+  
+  "M+57.02146+15.994915+42.010565": 246.067425  # M + CAM + Oxidation + Acetylation
+  "M+57.02146+42.010565+15.994915": 246.067425  # M + CAM + Acetylation + Oxidation
+  "M+15.994915+57.02146+42.010565": 246.067425  # M + Oxidation + CAM + Acetylation
+  "M+15.994915+42.010565+57.02146": 246.067425  # M + Oxidation + Acetylation + CAM
+  "M+42.010565+57.02146+15.994915": 246.067425  # M + Acetylation + CAM + Oxidation
+  "M+42.010565+15.994915+57.02146": 246.067425  # M + Acetylation + Oxidation + CAM
+  
+  "H+57.02146+15.994915+42.010565": 252.085852  # H + CAM + Oxidation + Acetylation
+  "H+57.02146+42.010565+15.994915": 252.085852  # H + CAM + Acetylation + Oxidation
+  "H+15.994915+57.02146+42.010565": 252.085852  # H + Oxidation + CAM + Acetylation
+  "H+15.994915+42.010565+57.02146": 252.085852  # H + Oxidation + Acetylation + CAM
+  "H+42.010565+57.02146+15.994915": 252.085852  # H + Acetylation + CAM + Oxidation
+  "H+42.010565+15.994915+57.02146": 252.085852  # H + Acetylation + Oxidation + CAM
+  
+  "F+57.02146+15.994915+42.010565": 262.095354  # F + CAM + Oxidation + Acetylation
+  "F+57.02146+42.010565+15.994915": 262.095354  # F + CAM + Acetylation + Oxidation
+  "F+15.994915+57.02146+42.010565": 262.095354  # F + Oxidation + CAM + Acetylation
+  "F+15.994915+42.010565+57.02146": 262.095354  # F + Oxidation + Acetylation + CAM
+  "F+42.010565+57.02146+15.994915": 262.095354  # F + Acetylation + CAM + Oxidation
+  "F+42.010565+15.994915+57.02146": 262.095354  # F + Acetylation + Oxidation + CAM
+  
+  "R+57.02146+15.994915+42.010565": 271.128051  # R + CAM + Oxidation + Acetylation
+  "R+57.02146+42.010565+15.994915": 271.128051  # R + CAM + Acetylation + Oxidation
+  "R+15.994915+57.02146+42.010565": 271.128051  # R + Oxidation + CAM + Acetylation
+  "R+15.994915+42.010565+57.02146": 271.128051  # R + Oxidation + Acetylation + CAM
+  "R+42.010565+57.02146+15.994915": 271.128051  # R + Acetylation + CAM + Oxidation
+  "R+42.010565+15.994915+57.02146": 271.128051  # R + Acetylation + Oxidation + CAM
+  
+  "Y+57.02146+15.994915+42.010565": 278.090269  # Y + CAM + Oxidation + Acetylation
+  "Y+57.02146+42.010565+15.994915": 278.090269  # Y + CAM + Acetylation + Oxidation
+  "Y+15.994915+57.02146+42.010565": 278.090269  # Y + Oxidation + CAM + Acetylation
+  "Y+15.994915+42.010565+57.02146": 278.090269  # Y + Oxidation + Acetylation + CAM
+  "Y+42.010565+57.02146+15.994915": 278.090269  # Y + Acetylation + CAM + Oxidation
+  "Y+42.010565+15.994915+57.02146": 278.090269  # Y + Acetylation + Oxidation + CAM
+  
+  "W+57.02146+15.994915+42.010565": 301.106253  # W + CAM + Oxidation + Acetylation
+  "W+57.02146+42.010565+15.994915": 301.106253  # W + CAM + Acetylation + Oxidation
+  "W+15.994915+57.02146+42.010565": 301.106253  # W + Oxidation + CAM + Acetylation
+  "W+15.994915+42.010565+57.02146": 301.106253  # W + Oxidation + Acetylation + CAM
+  "W+42.010565+57.02146+15.994915": 301.106253  # W + Acetylation + CAM + Oxidation
+  "W+42.010565+15.994915+57.02146": 301.106253  # W + Acetylation + Oxidation + CAM
+  
+  # N-terminal modifications
+  "+42.010565": 42.010565   # Acetylation
+  "+42.011": 42.010565      # Acetylation (alternate precision)
+  "+43.006": 43.005814      # Carbamylation
+  "-17.027": -17.026549     # NH3 loss
+  "+43.006-17.027": 25.980265 # Carbamylation and NH3 loss
