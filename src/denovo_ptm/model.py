@@ -106,14 +106,16 @@ class Spec2PepWithPTM(pl.LightningModule):
         )
         self.stop_token = self.decoder._aa2idx["$"]
 
-        # Logging
+        # Logging.
         self.calculate_precision = calculate_precision
         self.n_log = n_log
+        self._history = []
         if tb_summarywriter is not None:
             self.tb_summarywriter = SummaryWriter(tb_summarywriter)
         else:
             self.tb_summarywriter = tb_summarywriter
 
+        # Output writer during predicting.
         self.out_writer = out_writer
      
     
