@@ -153,8 +153,8 @@ def msp_to_mgf(msp_filename, mgf_filename):
 
 if __name__ == "__main__":
     print("Converting the data...")
-    msp_file = ".human_hcd_tryp_best.msp"
-    mgf_file = ".human_hcd_tryp_best.mgf"
+    msp_file = "human_hcd_tryp_best.msp"
+    mgf_file = "human_hcd_tryp_best.mgf"
     if not os.path.exists(mgf_file):
         print("Converting to MGF format")
         msp_to_mgf(msp_file, mgf_file)
