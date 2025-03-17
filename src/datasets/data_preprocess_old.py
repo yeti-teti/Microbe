@@ -1,21 +1,15 @@
 import os
 import re
 import csv
+
 import numpy as np
 
+
 # MSP Parsing and SPectrum Structuring
-def parse_msp(filename, limit=None):
-    """
-    Parse an MSP spectral library file and yield spectra as dictionaries.
-    
-    Args:
-        filename: Path to the MSP file
-        limit: Maximum number of spectra to parse (None for all)
-    """
+def parse_msp(filename):
+    """Parse an MSP spectral library file and yield spectra as dictionaries."""
     spectrum = {}
     peaks_mz, peaks_int, peaks_ann = [], [], []
-    spectrum_count = 0
-    
     with open(filename, 'r') as f:
         for line in f:
             line = line.strip()
@@ -31,14 +25,7 @@ def parse_msp(filename, limit=None):
                         spectrum["charge"] = spectrum["Charge"]
                     if "Parent" in spectrum:
                         spectrum["parent"] = spectrum["Parent"]
-                    
                     yield spectrum
-                    spectrum_count += 1
-                    
-                    # Check if we've reached the limit
-                    if limit is not None and spectrum_count >= limit:
-                        return
-                
                 spectrum = {"Name": line[6:].strip()}
                 peaks_mz, peaks_int, peaks_ann = [], [], []
             elif line.startswith("Comment: "):
@@ -61,9 +48,7 @@ def parse_msp(filename, limit=None):
                     if len(parts) > 2:
                         ann = parts[2].strip('"')
                         peaks_ann.append(ann)
-    
-    # Handle the last spectrum
-    if spectrum and (limit is None or spectrum_count < limit):
+    if spectrum:
         spectrum["mz"] = np.array(peaks_mz, dtype=np.float32)
         spectrum["intensity"] = np.array(peaks_int, dtype=np.float32)
         if "Fullname" in spectrum:
@@ -86,6 +71,7 @@ def preprocess_intensities(spec):
 
 # Function to apply modifications to sequence
 def apply_modifications(sequence, mods_str, ptm_dict):
+    
     """Apply modifications to a peptide sequence based on the Mods string."""
     if mods_str == "0":
         return sequence 
@@ -117,15 +103,8 @@ def apply_modifications(sequence, mods_str, ptm_dict):
     return "".join(seq_list)
 
 # MSP to MGF Converter
-def msp_to_mgf(msp_filename, mgf_filename, limit=None):
-    """
-    Convert an MSP file to an annotated MGF file for Casanovo training.
-    
-    Args:
-        msp_filename: Path to the input MSP file
-        mgf_filename: Path to the output MGF file
-        limit: Maximum number of spectra to process (None for all)
-    """
+def msp_to_mgf(msp_filename, mgf_filename):
+    """Convert an MSP file to an annotated MGF file for Casanovo training."""
     ptms = {
         "CAM": 57.02146,      # Carbamidomethylation on Cysteine
         "Oxidation": 15.994915,      # Oxidation (commonly on Methionine)
@@ -134,10 +113,7 @@ def msp_to_mgf(msp_filename, mgf_filename, limit=None):
     
     out = open(mgf_filename, "w")
     spectrum_index = 0
-    
-    print(f"Converting up to {limit if limit else 'all'} spectra from MSP to MGF...")
-    
-    for spec in parse_msp(msp_filename, limit=limit):
+    for spec in parse_msp(msp_filename):
         preprocess_intensities(spec)
         if "sequence" not in spec:
             continue
@@ -170,26 +146,17 @@ def msp_to_mgf(msp_filename, mgf_filename, limit=None):
         
         out.write("END IONS\n\n")
         spectrum_index += 1
-        
-        # Show progress every 1000 spectra
-        if spectrum_index % 1000 == 0:
-            print(f"Processed {spectrum_index} spectra...")
     
     out.close()
-    print(f"Converted {spectrum_index} spectra from '{msp_filename}' to '{mgf_filename}'.")
+    print(f"Converted MSP '{msp_filename}' to MGF '{mgf_filename}'.")
+            
 
 if __name__ == "__main__":
-    print("Starting data conversion...")
+    print("Converting the data...")
     msp_file = "human_hcd_tryp_best.msp"
-    mgf_file = "human_hcd_tryp_best_10k.mgf"
-    
-    # Process only 10,000 spectra
-    limit = 10000
-    
+    mgf_file = "human_hcd_tryp_best.mgf"
     if not os.path.exists(mgf_file):
-        print(f"Converting to MGF format (limit: {limit} spectra)")
-        msp_to_mgf(msp_file, mgf_file, limit=limit)
-    else:
-        print(f"MGF file '{mgf_file}' already exists. Delete it to reconvert.")
+        print("Converting to MGF format")
+        msp_to_mgf(msp_file, mgf_file)
 
-    print("Data conversion completed.")
+    print("Data converted...")
