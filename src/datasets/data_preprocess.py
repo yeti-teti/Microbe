@@ -3,7 +3,7 @@ import re
 import csv
 import numpy as np
 
-# MSP Parsing and SPectrum Structuring
+# MSP Parsing and Spectrum Structuring
 def parse_msp(filename, limit=None):
     """
     Parse an MSP spectral library file and yield spectra as dictionaries.
@@ -80,14 +80,18 @@ def parse_msp(filename, limit=None):
 def preprocess_intensities(spec):
     """Apply TIC normalization and square-root transform to intensities."""
     total = spec["intensity"].sum()
-    if total > 0:
+    if total > 0 and not np.isnan(total) and not np.isinf(total):
         spec["intensity"] = spec["intensity"] / total
         spec["intensity"] = np.sqrt(spec["intensity"])
+    else:
+        # Set intensities to zero if total is invalid to avoid NaN
+        spec["intensity"] = np.zeros_like(spec["intensity"])
+        print(f"Warning: Spectrum '{spec.get('Name', 'unknown')}' has invalid intensity sum ({total}), setting intensities to zero.")
 
 # Function to apply modifications to sequence
 def apply_modifications(sequence, mods_str, ptm_dict):
     """Apply modifications to a peptide sequence based on the Mods string."""
-    if mods_str == "0":
+    if mods_str == "0" or not mods_str:
         return sequence 
     
     # Extract the number of modifications and the modification details
@@ -138,8 +142,21 @@ def msp_to_mgf(msp_filename, mgf_filename, limit=None):
     print(f"Converting up to {limit if limit else 'all'} spectra from MSP to MGF...")
     
     for spec in parse_msp(msp_filename, limit=limit):
+        # Validate data for NaN or infinity
+        if np.any(np.isnan(spec["mz"])) or np.any(np.isinf(spec["mz"])) or \
+           np.any(np.isnan(spec["intensity"])) or np.any(np.isinf(spec["intensity"])):
+            print(f"Skipping spectrum '{spec.get('Name', 'unknown')}' due to NaN or infinite values in mz or intensity.")
+            continue
+        
         preprocess_intensities(spec)
+        
+        # Check if intensities are valid after preprocessing
+        if np.any(np.isnan(spec["intensity"])) or np.any(np.isinf(spec["intensity"])):
+            print(f"Skipping spectrum '{spec.get('Name', 'unknown')}' due to invalid intensities after preprocessing.")
+            continue
+        
         if "sequence" not in spec:
+            print(f"Skipping spectrum '{spec.get('Name', 'unknown')}' due to missing sequence.")
             continue
         
         # Get the pepmass (precursor m/z)
@@ -153,8 +170,8 @@ def msp_to_mgf(msp_filename, mgf_filename, limit=None):
         # Apply modifications to sequence
         seq = spec["sequence"]
         mods = spec.get("mods", "0")
-        check_mod = int(mods[0])
-        if(check_mod != 0):
+        check_mod = int(mods[0]) if mods else 0
+        if check_mod != 0:
             modified_seq = apply_modifications(seq, mods, ptms)
         else:
             modified_seq = seq
@@ -181,10 +198,10 @@ def msp_to_mgf(msp_filename, mgf_filename, limit=None):
 if __name__ == "__main__":
     print("Starting data conversion...")
     msp_file = "human_hcd_tryp_best.msp"
-    mgf_file = "human_hcd_tryp_best_10k.mgf"
+    mgf_file = "human_hcd_tryp_best.mgf"
     
-    # Process only 10,000 spectra
-    limit = 10000
+    # Process up to 100,000 spectra
+    limit = 100000
     
     if not os.path.exists(mgf_file):
         print(f"Converting to MGF format (limit: {limit} spectra)")

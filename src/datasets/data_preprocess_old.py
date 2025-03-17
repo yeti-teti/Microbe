@@ -63,11 +63,12 @@ def parse_msp(filename):
 
 # Intensity Normalization and Transformation
 def preprocess_intensities(spec):
-    """Apply TIC normalization and square-root transform to intensities."""
     total = spec["intensity"].sum()
     if total > 0:
         spec["intensity"] = spec["intensity"] / total
         spec["intensity"] = np.sqrt(spec["intensity"])
+    else:
+        spec["intensity"] = np.zeros_like(spec["intensity"])  # Or skip this spectrum
 
 # Function to apply modifications to sequence
 def apply_modifications(sequence, mods_str, ptm_dict):

@@ -50,37 +50,29 @@ class SpectrumDataset(Dataset):
         with self.index:
             return self.index.get_spectrum_id(idx)
         
-    def _process_peaks(
-        self,
-        mz_array: np.ndarray,
-        int_array: np.ndarray,
-        precursor_mz: float,
-        precursor_charge: int,
-    ) -> torch.Tensor:
+    def _process_peaks(self, mz_array, int_array, precursor_mz, precursor_charge):
         spectrum = sus.MsmsSpectrum(
-            "",
-            precursor_mz,
-            precursor_charge,
-            mz_array.astype(np.float64),
-            int_array.astype(np.float32),
+            "", precursor_mz, precursor_charge,
+            mz_array.astype(np.float64), int_array.astype(np.float32)
         )
         try:
             spectrum.set_mz_range(self.min_mz, self.max_mz)
             if len(spectrum.mz) == 0:
-                raise ValueError
+                raise ValueError("No peaks in mz range")
             spectrum.remove_precursor_peak(self.remove_precursor_tol, "Da")
             if len(spectrum.mz) == 0:
-                raise ValueError
+                raise ValueError("No peaks after precursor removal")
             spectrum.filter_intensity(self.min_intensity, self.n_peaks)
             if len(spectrum.mz) == 0:
-                raise ValueError
+                raise ValueError("No peaks after intensity filter")
             spectrum.scale_intensity("root", 1)
-            intensities = spectrum.intensity / np.linalg.norm(
-                spectrum.intensity
-            )
+            norm = np.linalg.norm(spectrum.intensity)
+            if norm == 0:
+                raise ValueError("Zero norm intensity")
+            intensities = spectrum.intensity / norm
             return torch.tensor(np.array([spectrum.mz, intensities])).T.float()
-        except ValueError:
-            # Replace invalid spectra by a dummy spectrum.
+        except ValueError as e:
+            print(f"Warning: Spectrum processed as dummy - {str(e)}")
             return torch.tensor([[0, 1]]).float()
     
     @property
