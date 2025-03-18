@@ -83,7 +83,7 @@ train_label_smoothing: 0.01
 # Number of spectra in one training batch.
 train_batch_size: 32
 # Max number of training epochs.
-max_epochs: 1
+max_epochs: 10
 # Number of validation steps to run before training begins.
 num_sanity_val_steps: 0
 # Calculate peptide and amino acid precision during training.

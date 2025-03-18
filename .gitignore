@@ -1,0 +1,5 @@
+/lightning_logs/*
+/outputs/*
+*.log
+*.mztab
+TODO.txt

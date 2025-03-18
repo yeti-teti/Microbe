@@ -1,0 +1,6 @@
+# The model is working, as seen from the sequence on the mztab file after predicting
+# But the way the mass offset is calcualted is not working, need to fix this.
+# But the way the predicted data is saved using ms_io.py is not working, need to fix this
+# After, fixing the ms_io file do the inference again
+# Do the inference for both the casonovo model and this model on the data given by Aivett
+# Evaluate the model

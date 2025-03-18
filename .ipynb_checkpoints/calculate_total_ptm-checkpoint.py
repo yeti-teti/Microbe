@@ -8,17 +8,19 @@ with open("predictions.mztab", "r") as f:
 psh_index = next(i for i, line in enumerate(lines) if line.startswith("PSH"))
 
 # Extract the header (excluding "PSH")
-header = lines[psh_index].strip().split("\t")[1:]  # 20 columns
+header = lines[psh_index].strip().split("*")[1:]  # 20 columns
 
 # Process PSM lines
 psm_lines = []
 for line in lines[psh_index + 1:]:
     if line.startswith("PSM"):
-        parts = line.strip().split("\t")[1:]  # Exclude "PSM"
+        parts = line.strip().split("*")[1:]  # Exclude "PSM"
         if len(parts) == len(header) - 1:  # 19 columns (missing total_ptm_mass_shift)
+            print("No PTMs")
             parts.append("0.0")  # Add default total_ptm_mass_shift
             psm_lines.append(parts)
         elif len(parts) == len(header):  # 20 columns
+            print("PTMs present")
             psm_lines.append(parts)
         else:
             print(f"Skipping line with {len(parts)} columns: {line.strip()}")
@@ -29,6 +31,7 @@ if not psm_lines:
 
 # Create DataFrame
 mztab_df = pd.DataFrame(psm_lines, columns=header)
+print(mztab_df)
 
 # Convert total_ptm_mass_shift to float
 mztab_df["total_ptm_mass_shift"] = pd.to_numeric(mztab_df["total_ptm_mass_shift"], errors='coerce').fillna(0.0)
