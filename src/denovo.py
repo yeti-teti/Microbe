@@ -277,7 +277,7 @@ def setup_model(
     output: Optional[Path],
     is_train: bool,
 ) -> Config:
-    """Setup Casanovo for most commands.
+    """Setup model for most commands.
 
     Parameters
     ----------

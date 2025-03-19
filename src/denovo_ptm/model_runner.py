@@ -73,19 +73,21 @@ class ModelRunner:
         train_peak_path: Iterable[str],
         valid_peak_path: Iterable[str],
     ) -> None:
-        
         self.initialize_trainer(train=True)
         self.initialize_model(train=True)
-
+    
         train_index = self._get_index(train_peak_path, True, "training")
         valid_index = self._get_index(valid_peak_path, True, "validation")
         self.initialize_data_module(train_index, valid_index)
         self.loaders.setup()
-
+    
+        # Pass ckpt_path if a checkpoint is provided
+        ckpt_path = self.model_filename if self.model_filename else None
         self.trainer.fit(
             self.model,
             self.loaders.train_dataloader(),
             self.loaders.val_dataloader(),
+            ckpt_path=ckpt_path  # Add this to resume from checkpoint
         )
 
     def evaluate(self, peak_path: Iterable[str], output_eval: str = None) -> None:
@@ -227,34 +229,27 @@ class ModelRunner:
             raise FileNotFoundError("Could not find the model weights file")
 
         # First try loading model details from the weights file, otherwise use the provided configuration.
-        device = torch.empty(1).device  # Use the default device.
-        try:
-            self.model = Spec2PepWithPTM.load_from_checkpoint(
-                self.model_filename, map_location=device, **loaded_model_params
-            )
-
-            architecture_params = set(model_params.keys()) - set(
-                loaded_model_params.keys()
-            )
-            for param in architecture_params:
-                if model_params[param] != self.model.hparams[param]:
-                    warnings.warn(
-                        f"Mismatching {param} parameter in "
-                        f"model checkpoint ({self.model.hparams[param]}) "
-                        f"vs config file ({model_params[param]}); "
-                        "using the checkpoint."
-                    )
-        except RuntimeError:
+        if self.model_filename is not None:
+            if not Path(self.model_filename).exists():
+                logger.error("Could not find the model weights at file %s", self.model_filename)
+                raise FileNotFoundError("Could not find the model weights file")
+    
+            device = torch.empty(1).device  # Use the default device
             try:
                 self.model = Spec2PepWithPTM.load_from_checkpoint(
-                    self.model_filename,
-                    map_location=device,
-                    **model_params,
+                    self.model_filename, map_location=device, **loaded_model_params
                 )
             except RuntimeError:
-                raise RuntimeError(
-                    "Weights file incompatible"
-                )
+                try:
+                    self.model = Spec2PepWithPTM.load_from_checkpoint(
+                        self.model_filename,
+                        map_location=device,
+                        **model_params,
+                    )
+                except RuntimeError:
+                    raise RuntimeError(
+                        "Weights file incompatible"
+                    )
     
     def initialize_data_module(
         self,
