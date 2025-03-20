@@ -34,7 +34,7 @@ save_top_k: 5
 model_save_folder_path: "./outputs"
 # Model validation and checkpointing frequency in training steps.
 #val_check_interval: 50_000
-val_check_interval: 2500
+val_check_interval: 9000
 # eval_output
 output_eval: "eval_results.txt"
 
@@ -83,7 +83,7 @@ train_label_smoothing: 0.01
 # Number of spectra in one training batch.
 train_batch_size: 32
 # Max number of training epochs.
-max_epochs: 10
+max_epochs: 1000
 # Number of validation steps to run before training begins.
 num_sanity_val_steps: 0
 # Calculate peptide and amino acid precision during training.
