@@ -28,7 +28,7 @@ class MztabWriter:
             ("mzTab-type", "Identification"),
             (
                 "description",
-                f"Casanovo identification file "
+                f"Data identification file "
                 f"{os.path.splitext(os.path.basename(self.filename))[0]}",
             ),
             (
@@ -318,6 +318,7 @@ class MztabWriter:
                         "null",                # unique
                         "null",                # database
                         "null",                # database_version
+                        "null",                # search engine 
                         psm[2],                # search_engine_score[1]
                         modifications,         # PTMs extracted from sequence
                         "null",                # retention_time

@@ -34,7 +34,7 @@ save_top_k: 5
 model_save_folder_path: "./outputs"
 # Model validation and checkpointing frequency in training steps.
 #val_check_interval: 50_000
-val_check_interval: 9000
+val_check_interval: 2500
 # eval_output
 output_eval: "eval_results.txt"
 

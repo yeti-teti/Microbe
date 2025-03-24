@@ -12,7 +12,7 @@ header = lines[psh_index].strip().split("*")[1:]  # 20 columns
 
 # Process PSM lines
 psm_lines = []
-for line in lines[psh_index + 1:]:
+for line in lines[psh_index:]:
     if line.startswith("PSM"):
         parts = line.strip().split("*")[1:]  # Exclude "PSM"
         if len(parts) == len(header) - 1:  # 19 columns (missing total_ptm_mass_shift)
