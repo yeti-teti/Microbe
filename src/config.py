@@ -12,11 +12,6 @@ from datetime import datetime
 
 logger = logging.getLogger("ptm")
 
-_config_deprecated = dict(
-    every_n_train_steps="val_check_interval",
-    max_iters="cosine_schedule_period_iters",
-)
-
 class Config:
     _default_config = Path(__file__).parent / "config.yaml"
     _config_types = dict(

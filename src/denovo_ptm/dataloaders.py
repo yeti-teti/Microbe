@@ -9,16 +9,7 @@ import torch
 from depthcharge.data import AnnotatedSpectrumIndex
 
 from ..data.datasets import AnnotatedSpectrumDataset, SpectrumDataset
-
-# Import the standardization function
-try:
-    from ..standardize_sequence import standardize_sequence
-except ImportError:
-    # Fallback if the import path doesn't work
-    import sys
-    import os
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from standardize_sequence import standardize_sequence
+from ..standardize_sequence import standardize_sequence
 
 logger = logging.getLogger("ptm")
 
@@ -132,7 +123,6 @@ def prepare_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
     spectra, precursor_mzs, precursor_charges, spectrum_ids = list(zip(*batch))
     
-    # Standardize peptide sequences if residue_dict is provided
     if residue_dict is not None and all(isinstance(seq, str) for seq in spectrum_ids):
         try:
             from src.standardize_sequence import standardize_sequence

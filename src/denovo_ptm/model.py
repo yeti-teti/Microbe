@@ -22,10 +22,6 @@ logger = logging.getLogger("ptm")
 
 
 class Spec2PepWithPTM(pl.LightningModule):
-    """
-    Model for spectrum to peptide sequence prediction with PTM identification.
-    Uses PyTorch's transformer components for simplicity and stability.
-    """
     def __init__(
         self, 
         dim_model: int = 512,
@@ -84,14 +80,6 @@ class Spec2PepWithPTM(pl.LightningModule):
         # Optimizer
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
-
-        for k in config._config_deprecated:
-            kwargs.pop(k, None)
-            warnings.warn(
-                f"Deprecated hyperparameter '{k} removed from the model.", 
-                DeprecationWarning, 
-            )
-        self.opt_kwargs = kwargs
 
         # Data properties
         self.max_length = max_length
@@ -284,6 +272,10 @@ class Spec2PepWithPTM(pl.LightningModule):
             pred_tokens = tokens[i][: step + 1]
             peptide_len = len(pred_tokens)
             peptide = self.decoder.detokenize(pred_tokens)
+
+            # Remove all '$' from the sequence, not just at ends
+            peptide = [aa for aa in peptide if aa != '$']
+            peptide_len = len(peptide)  # Update length after filtering
             # Omit stop token.
             if self.decoder.reverse and peptide[0] == "$":
                 peptide = peptide[1:]
@@ -291,15 +283,12 @@ class Spec2PepWithPTM(pl.LightningModule):
             elif not self.decoder.reverse and peptide[-1] == "$":
                 peptide = peptide[:-1]
                 peptide_len -= 1
-            # Discard beams that were predicted to end but don't fit the minimum
-            # peptide length.
+                
+            # Discard beams that were predicted to end but don't fit the minimum peptide length.
             if finished_beams[i] and peptide_len < self.min_peptide_len:
                 discarded_beams[i] = True
                 continue
-            # Terminate the beam if it has not been finished by the model but
-            # the peptide mass exceeds the precursor m/z to an extent that it
-            # cannot be corrected anymore by a subsequently predicted AA with
-            # negative mass.
+                
             precursor_charge = precursors[i, 1]
             precursor_mz = precursors[i, 2]
             matches_precursor_mz = exceeds_precursor_mz = False
@@ -325,16 +314,10 @@ class Spec2PepWithPTM(pl.LightningModule):
                             self.isotope_error_range[1] + 1,
                         )
                     ]
-                    # Terminate the beam if the calculated m/z for the predicted
-                    # peptide (without potential additional AAs with negative
-                    # mass) is within the precursor m/z tolerance.
                     matches_precursor_mz = aa is None and any(
                         abs(d) < self.precursor_mass_tol
                         for d in delta_mass_ppm
                     )
-                    # Terminate the beam if the calculated m/z exceeds the
-                    # precursor m/z + tolerance and hasn't been corrected by a
-                    # subsequently predicted AA with negative mass.
                     if matches_precursor_mz:
                         exceeds_precursor_mz = False
                     else:
@@ -348,9 +331,7 @@ class Spec2PepWithPTM(pl.LightningModule):
                         break
                 except KeyError:
                     matches_precursor_mz = exceeds_precursor_mz = False
-            # Finish beams that fit or exceed the precursor m/z.
-            # Don't finish beams that don't include a stop token if they don't
-            # exceed the precursor m/z tolerance yet.
+                    
             if finished_beams[i]:
                 beam_fits_precursor[i] = matches_precursor_mz
             elif exceeds_precursor_mz:
@@ -652,14 +633,16 @@ class Spec2PepWithPTM(pl.LightningModule):
         ) in outputs:
             if len(peptide) == 0:
                 continue
+            # Remove all '$' characters from the peptide sequence
+            cleaned_peptide = ''.join(aa for aa in peptide if aa != '$')
             self.out_writer.psms.append(
                 (
-                    peptide,
+                    cleaned_peptide,
                     tuple(spectrum_i),
                     peptide_score,
                     charge,
                     precursor_mz,
-                    self.peptide_mass_calculator.mass(peptide, charge),
+                    self.peptide_mass_calculator.mass(cleaned_peptide, charge),
                     ",".join(list(map("{:.5f}".format, aa_scores))),
                 ),
             )
